@@ -136,6 +136,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         rollout_engines: Sequence[SGLangApiClient],
         engine_gpu_counts: Sequence[int] | None,
         engine_gpu_offsets: Sequence[int] | None,
+        engine_cell_ids: Sequence[str],
         parallel_state: ParallelState,
         placement: WeightUpdatePlacement,
         selector: str,
@@ -150,6 +151,11 @@ class UpdateWeightP2P(WeightTransferProtocol):
           replica that mirrors the target's sharding layout, enabling correct
           weight format conversion before transfer.
         """
+        assert len(engine_cell_ids) == len(rollout_engines), (
+            f"[P2P-Shared] {len(engine_cell_ids)} cell ids for {len(rollout_engines)} rollout engines; "
+            f"the per-engine metadata must describe the same engines"
+        )
+
         self.disconnect()
         self.rollout_engines = rollout_engines
 
@@ -181,7 +187,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
                 )
             cell_updaters_by_engine_ind = {
                 engine_ind: _P2PInferenceCellUpdater(
-                    engine_ind=engine_ind,
+                    cell_id=engine_cell_ids[engine_ind],
                     transfer_engine=self._transfer_engine,
                     transfer_manager=self.transfer_manager,
                     targets_by_engine_rank=cell_targets,
