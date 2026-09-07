@@ -2,6 +2,7 @@ import json
 import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future
 from typing import Any, NamedTuple
 
 import torch
@@ -51,7 +52,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
     For each engine rank:
         load_weights(shared buffer) → P2P write
         where the last rank's write is submitted to a background thread
-    wait_transfers() at finish to collect all background writes
+    each inference cell collects its own writes at finish
     """
 
     def __init__(self, args: Namespace) -> None:
@@ -70,6 +71,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self._weight_memory_registry: dict[str, tuple[int, int, int]] = {}
         self._replicas_by_representation: dict[str, torch.nn.Module] = {}
         self.cell_updaters: list[_P2PInferenceCellUpdater] = []
+        self._unfinished_writes: list[Future] = []
         self.remote_weight_infos_by_session_id: dict[str, tuple] = {}
         self.session_id_to_server_args: dict[str, ServerArgs] = {}
         # in self._transfer_engine_meta_list: tuple of
@@ -81,7 +83,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
         """Wait for all background P2P writes to complete."""
         if not self.is_sender:
             return
-        self.transfer_manager.wait_transfers()
+        for cell_updater in self.cell_updaters:
+            cell_updater.wait_for_pending_writes()
         self._model_param_stager.assert_all_done()
 
     def begin_sync(
@@ -221,9 +224,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self.is_sender = bool(self._transfer_engine_meta_list)
 
     def disconnect(self) -> None:
-        self.transfer_manager.wait_transfers()
-        for cell_updater in self.cell_updaters:
-            cell_updater.dispose()
+        self._drain_pending_writes()
         self.cell_updaters = []
         self._transfer_engine_meta_list = []
         self.remote_weight_infos_by_session_id = {}
@@ -231,6 +232,17 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self.rollout_engines = []
         self.is_sender = False
         self._model_param_stager = ModelParamStager()
+
+    def _drain_pending_writes(self) -> None:
+        for cell_updater in self.cell_updaters:
+            cell_updater.wait_for_pending_writes()
+            cell_updater.dispose()
+            self._unfinished_writes += cell_updater.take_unfinished_writes()
+        if self._unfinished_writes:
+            logger.error(
+                f"[P2P-Shared] {len(self._unfinished_writes)} p2p writes of this trainer rank never finished; "
+                f"their source buffers stay registered for the lifetime of this actor"
+            )
 
     def _assert_one_weight_representation(self, engine_rank: int, session_ids: list[str]) -> None:
         keys_by_session = {
