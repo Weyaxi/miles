@@ -7,7 +7,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import NamedTuple
 
 import ray
-import torch
 from sglang.srt.server_args import ServerArgs
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import get_parallel_state
@@ -142,23 +141,16 @@ class RemoteWeightInfo:
     weights_info: dict[str, RemoteWeightLocation]  # name -> (remote_address, numel, element_size)
 
 
-class TransferEngineMeta(NamedTuple):
-    model_replica: torch.nn.Module
-    remote_weight_infos: list[RemoteWeightInfo]
-
-
 class P2PTransferManager:
     """Generic async task manager for P2P writes.
 
-    Accepts arbitrary callables via submit(), runs them in a thread pool,
-    and tracks futures for bulk waiting.
+    Accepts arbitrary callables via submit(), runs them in a thread pool.
     """
 
     def __init__(self, num_workers: int = 8, transfer_timeout: float = 30.0):
         self.num_workers = num_workers
         self.transfer_timeout = transfer_timeout
         self.executor: ThreadPoolExecutor | None = None
-        self.transfer_futures: list[Future] = []
 
     def ensure_started(self) -> None:
         if self.executor is None:
@@ -166,17 +158,9 @@ class P2PTransferManager:
             self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
 
     def submit(self, fn: Callable, *args) -> Future:
-        """Submit a callable and return its future (also tracked for bulk waiting)."""
+        """Submit a callable to the thread pool and return its future."""
         self.ensure_started()
-        future = self.executor.submit(fn, *args)
-        self.transfer_futures.append(future)
-        return future
-
-    def wait_transfers(self) -> None:
-        """Wait for all submitted tasks to complete."""
-        for future in self.transfer_futures:
-            future.result(timeout=self.transfer_timeout)
-        self.transfer_futures.clear()
+        return self.executor.submit(fn, *args)
 
 
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:

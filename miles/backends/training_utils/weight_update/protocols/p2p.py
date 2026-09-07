@@ -1,6 +1,8 @@
 import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future
+from typing import Any, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -27,13 +29,15 @@ from .p2p_transfer_utils import (
     P2PTransferManager,
     RemoteTransferPlan,
     RemoteWeightInfo,
-    TransferEngineMeta,
     create_transfer_engine,
     query_remote_weight_infos,
     register_cpu_memory,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ============================== transfer protocol ==============================
 
 
 class UpdateWeightP2P(WeightTransferProtocol):
@@ -44,7 +48,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
     For each engine rank:
         load_weights(shared buffer) → P2P write
         where the last rank's write is submitted to a background thread
-    wait_transfers() at finish to collect all background writes
+    each inference cell collects its own writes at finish
     """
 
     def __init__(self, args: Namespace) -> None:
@@ -53,6 +57,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self.global_rank = dist.get_rank(group=get_gloo_group())
         self._model_registered = False
         self._model_param_stager = ModelParamStager()
+        self._cell_updaters: list[_P2PInferenceCellUpdater] = []
         self.transfer_manager = P2PTransferManager(
             num_workers=getattr(args, "p2p_transfer_num_workers", 4),
             transfer_timeout=getattr(args, "p2p_transfer_timeout", 30.0),
@@ -62,7 +67,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
         """Wait for all background P2P writes to complete."""
         if not self.is_sender:
             return
-        self.transfer_manager.wait_transfers()
+        for cell_updater in self._cell_updaters:
+            cell_updater.wait_for_pending_writes()
         self._model_param_stager.assert_all_done()
 
     def begin_sync(
@@ -98,19 +104,17 @@ class UpdateWeightP2P(WeightTransferProtocol):
 
                 # Last engine rank: fire-and-forget all sessions to background,
                 # as the weight will no longer be overwritten
-                futures = [
-                    self.transfer_manager.submit(
-                        self._do_p2p_write_one_session,
-                        remote_session,
-                        transfer_ready_params,
+                for cell_updater in meta.cell_updaters:
+                    cell_updater.submit_write(
+                        engine_rank=meta.engine_rank,
+                        names=transfer_ready_params,
+                        weight_memory_registry=self._weight_memory_registry,
                     )
-                    for remote_session in meta.remote_weight_infos
-                ]
 
                 if i != last_idx:
                     # Non-last engine rank needs to be fully written to target before next update can happen.
-                    for f in futures:
-                        f.result()
+                    for cell_updater in meta.cell_updaters:
+                        cell_updater.wait_for_pending_writes()
 
         converted_named_tensors.clear()
 
@@ -157,9 +161,27 @@ class UpdateWeightP2P(WeightTransferProtocol):
             # in self._transfer_engine_meta_list: tuple of
             # - single CPU replica shared among all sessions
             # - related remote weight info
-            self._transfer_engine_meta_list: list[TransferEngineMeta] = []
+            self._transfer_engine_meta_list: list[_TransferEngineMeta] = []
+            targets_by_engine_ind: dict[int, dict[int, RemoteWeightInfo]] = {}
+            for target in targets:
+                session_id = targets_to_session_id[(target.engine_ind, target.engine_rank)]
+                cell_targets = targets_by_engine_ind.setdefault(target.engine_ind, {})
+                assert target.engine_rank not in cell_targets
+                cell_targets[target.engine_rank] = RemoteWeightInfo(
+                    session_id, self.remote_weight_infos_by_session_id[session_id][0]
+                )
+            cell_updaters_by_engine_ind = {
+                engine_ind: _P2PInferenceCellUpdater(
+                    engine_ind=engine_ind,
+                    transfer_engine=self._transfer_engine,
+                    transfer_manager=self.transfer_manager,
+                    targets_by_engine_rank=cell_targets,
+                )
+                for engine_ind, cell_targets in targets_by_engine_ind.items()
+            }
+            self._cell_updaters = list(cell_updaters_by_engine_ind.values())
             first_engine_rank = True
-            for rank_targets in targets_grouped_by_engine_rank.values():
+            for engine_rank, rank_targets in targets_grouped_by_engine_rank.items():
                 first_target = rank_targets[0]
                 session_id = targets_to_session_id[(first_target.engine_ind, first_target.engine_rank)]
                 parallelism_config = RankParallelismConfig.from_dict(
@@ -179,55 +201,100 @@ class UpdateWeightP2P(WeightTransferProtocol):
                     self._shared_param_mapper = ParameterMapper.from_model(model_replica)
                     first_engine_rank = False
 
-                remote_infos = [
-                    RemoteWeightInfo(
-                        targets_to_session_id[(t.engine_ind, t.engine_rank)],
-                        self.remote_weight_infos_by_session_id[targets_to_session_id[(t.engine_ind, t.engine_rank)]][
-                            0
-                        ],
-                    )
-                    for t in rank_targets
-                ]
+                rank_cell_updaters = [cell_updaters_by_engine_ind[target.engine_ind] for target in rank_targets]
 
                 self._transfer_engine_meta_list.append(
-                    TransferEngineMeta(model_replica=model_replica, remote_weight_infos=remote_infos)
+                    _TransferEngineMeta(
+                        engine_rank=engine_rank, model_replica=model_replica, cell_updaters=rank_cell_updaters
+                    )
                 )
 
-    def _do_p2p_write_one_session(self, remote_session: RemoteWeightInfo, names: list[str]) -> None:
-        """P2P write from shared CPU pinned buffers to a single remote session.
 
-        Used by the parallelized submission path where each session within an
-        engine rank is submitted as a separate task to P2PTransferManager.
-        """
-        source_ptrs, source_lens = [], []
-        valid_names = []
+# ============================ inference cell updater ============================
 
-        for name in names:
-            cpu_reg = self._weight_memory_registry.get(name)
-            assert cpu_reg, f"the _weight_memory_registry of {name} failed"
 
-            data_ptr, numel, ele_size = cpu_reg
-            source_ptrs.append(data_ptr)
-            source_lens.append(numel * ele_size)
-            valid_names.append(name)
+class _P2PInferenceCellUpdater:
+    def __init__(
+        self,
+        engine_ind: int,
+        transfer_engine: Any,
+        transfer_manager: P2PTransferManager,
+        targets_by_engine_rank: dict[int, RemoteWeightInfo],
+    ) -> None:
+        self.engine_ind = engine_ind
+        self._transfer_engine = transfer_engine
+        self._transfer_manager = transfer_manager
+        self._target_by_engine_rank = targets_by_engine_rank
+        self._pending_writes: list[Future[None]] = []
 
-        if not source_ptrs:
-            return
-
-        session_id = remote_session.session_id
-        target_ptrs = []
-        for name in valid_names:
-            if name in remote_session.weights_info:
-                target_ptrs.append(remote_session.weights_info[name].address)
-
-        assert len(target_ptrs) == len(source_ptrs), (
-            f"[P2P-Shared] Pointer count mismatch for session {session_id}, "
-            f"source: {len(source_ptrs)}, target: {len(target_ptrs)}"
+    def submit_write(
+        self, engine_rank: int, names: list[str], weight_memory_registry: dict[str, tuple[int, int, int]]
+    ) -> None:
+        self._pending_writes.append(
+            self._transfer_manager.submit(
+                _do_p2p_write_one_session,
+                self._transfer_engine,
+                self._target_by_engine_rank[engine_rank],
+                names,
+                weight_memory_registry,
+            )
         )
 
-        ret = self._transfer_engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
-        if ret < 0:
-            raise RuntimeError(f"[P2P-Shared] Transfer failed for session {session_id}, error: {ret}")
+    def wait_for_pending_writes(self) -> None:
+        pending, self._pending_writes = self._pending_writes, []
+        for future in pending:
+            future.result()
+
+
+class _TransferEngineMeta(NamedTuple):
+    engine_rank: int
+    model_replica: torch.nn.Module
+    cell_updaters: list[_P2PInferenceCellUpdater]
+
+
+def _do_p2p_write_one_session(
+    transfer_engine: Any,
+    remote_session: RemoteWeightInfo,
+    names: list[str],
+    weight_memory_registry: dict[str, tuple[int, int, int]],
+) -> None:
+    """P2P write from shared CPU pinned buffers to a single remote session.
+
+    Used by the parallelized submission path where each session within an
+    engine rank is submitted as a separate task to P2PTransferManager.
+    """
+    source_ptrs, source_lens = [], []
+    valid_names = []
+
+    for name in names:
+        cpu_reg = weight_memory_registry.get(name)
+        assert cpu_reg, f"the _weight_memory_registry of {name} failed"
+
+        data_ptr, numel, ele_size = cpu_reg
+        source_ptrs.append(data_ptr)
+        source_lens.append(numel * ele_size)
+        valid_names.append(name)
+
+    if not source_ptrs:
+        return
+
+    session_id = remote_session.session_id
+    target_ptrs = []
+    for name in valid_names:
+        if name in remote_session.weights_info:
+            target_ptrs.append(remote_session.weights_info[name].address)
+
+    assert len(target_ptrs) == len(source_ptrs), (
+        f"[P2P-Shared] Pointer count mismatch for session {session_id}, "
+        f"source: {len(source_ptrs)}, target: {len(target_ptrs)}"
+    )
+
+    ret = transfer_engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
+    if ret < 0:
+        raise RuntimeError(f"[P2P-Shared] Transfer failed for session {session_id}, error: {ret}")
+
+
+# ================================= cpu replica =================================
 
 
 def _create_cpu_replica(
