@@ -67,6 +67,10 @@ class LinearTrajectory:
     but the agent may retry from an earlier point (e.g. re-running a tool call),
     in which case the session is rolled back at most one assistant step.
 
+    ``session_args`` is what the tokenizer recorded when the first turn
+    committed (``TITOTokenizer.session_args_after_first_turn``); later turns
+    must render alike so the stored token history keeps one interpretation.
+
     Concurrency contract: all mutating methods must be called under ``self.lock``.
     """
 
@@ -77,6 +81,7 @@ class LinearTrajectory:
     trajectory_token_ids: list[list[int]] = field(default_factory=list)
     generated_checkpoint_message_ends: list[int] = field(default_factory=list)
     num_assistant: int = 0
+    session_args: dict[str, Any] = field(default_factory=dict)
 
     @property
     def token_ids(self) -> list[int]:
@@ -333,7 +338,7 @@ class SessionRegistry:
             return None
         try:
             tools = session.records[-1].request.get("tools") if session.records else None
-            expected_ids = self.tito_tokenizer.apply_chat_template(
+            expected_ids = self.tito_tokenizer.for_session(session.session_args).apply_chat_template(
                 session.messages,
                 tools=tools,
                 add_generation_prompt=False,

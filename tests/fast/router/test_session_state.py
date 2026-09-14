@@ -959,3 +959,23 @@ class TestComputeSessionMismatch:
         _, kwargs = mock_tokenize.call_args
         assert kwargs["tools"] == tools
         assert kwargs["add_generation_prompt"] is False
+
+    def test_renders_with_the_kwargs_recorded_in_session_args(self, registry: SessionRegistryV2):
+        sid = registry.create_session()
+        session = registry.get_session(sid)
+        _commit(session, [SYS_MSG, USER_MSG], ASSISTANT_MSG_1, [1, 2, 3], [10, 11], max_trim_tokens=0)
+        session.session_args = {"chat_template_kwargs": {"reasoning_effort": "low"}}
+
+        seen_kwargs: list[dict] = []
+
+        def renderer_with(kwargs):
+            seen_kwargs.append(kwargs)
+            renderer = MagicMock()
+            renderer.apply_chat_template.return_value = [1, 2, 3, 10, 11]
+            return renderer
+
+        registry.tito_tokenizer.with_chat_template_kwargs = renderer_with
+        registry.comparator = MagicMock(compare_sequences=MagicMock(return_value=[]))
+
+        assert registry.compute_session_mismatch(session) == []
+        assert seen_kwargs == [{"reasoning_effort": "low"}]

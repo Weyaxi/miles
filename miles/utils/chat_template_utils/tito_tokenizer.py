@@ -122,15 +122,63 @@ class TITOTokenizer:
 
     def clone_with_chat_template_kwargs(self, request_kwargs: dict[str, Any]) -> TITOTokenizer:
         """Create a request-scoped copy with negligible overhead."""
-        return type(self)(
-            self.tokenizer,
-            chat_template_kwargs=template.merge_chat_template_kwargs(
+        return self.with_chat_template_kwargs(
+            template.merge_chat_template_kwargs(
                 self.chat_template_kwargs,
                 request_kwargs,
                 alias_keys=self.chat_template_kwarg_aliases,
-            ),
+            )
+        )
+
+    def with_chat_template_kwargs(self, chat_template_kwargs: dict[str, Any]) -> TITOTokenizer:
+        """A copy that renders with exactly ``chat_template_kwargs`` (no merge with this instance's)."""
+        return type(self)(
+            self.tokenizer,
+            chat_template_kwargs=chat_template_kwargs,
             assistant_start_str=self._assistant_start_str,
         )
+
+    # --- session server: template kwargs per request and per session -------
+    # ``session_args`` is the dict a session keeps from its first committed
+    # turn (``session_args_after_first_turn``) and hands back on every later
+    # request.  The base class records the effective ``chat_template_kwargs``;
+    # a family that reads other request fields into the template (Qwen3.8's
+    # ``reasoning_effort``) overrides ``for_request`` and calls ``super()``.
+
+    def for_session(self, session_args: dict[str, Any]) -> TITOTokenizer:
+        """The renderer a session's committed history was rendered with: this
+        launch tokenizer until the first turn records its kwargs."""
+        recorded = session_args.get("chat_template_kwargs")
+        return self if recorded is None else self.with_chat_template_kwargs(recorded)
+
+    def for_request(self, client: dict[str, Any], *, session_args: dict[str, Any]) -> TITOTokenizer:
+        """The renderer for one session-server request.
+
+        The request's ``chat_template_kwargs`` are merged over the session's
+        renderer (``for_session``).  Once the session recorded its kwargs, they
+        are fixed: omitted keys inherit them and a request that would render
+        differently is refused, because the stored token history has one
+        interpretation.  Raises ``ValueError`` for a request the renderer
+        refuses; the session server turns that into a 400.
+        """
+        request_kwargs = client.get("chat_template_kwargs")
+        if request_kwargs is not None and not isinstance(request_kwargs, dict):
+            raise ValueError("chat_template_kwargs must be an object")
+        base = self.for_session(session_args)
+        renderer = base.clone_with_chat_template_kwargs(request_kwargs or {})
+        if session_args and renderer.chat_template_kwargs != base.chat_template_kwargs:
+            raise ValueError(
+                f"chat_template_kwargs {renderer.chat_template_kwargs!r} is not accepted: the session fixed "
+                f"{base.chat_template_kwargs!r} on its first turn"
+            )
+        return renderer
+
+    def session_args_after_first_turn(self, response: dict[str, Any]) -> dict[str, Any]:
+        """What the session records when its first turn commits, rendered by
+        this request renderer: the kwargs every later turn must render with.
+        ``response`` is the committed chat completion, for families whose first
+        reply settles something."""
+        return {"chat_template_kwargs": dict(self.chat_template_kwargs)}
 
     def create_comparator(self) -> TokenSeqComparator:
         """Create a :class:`TokenSeqComparator` configured with this

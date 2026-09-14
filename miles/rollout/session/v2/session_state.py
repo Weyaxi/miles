@@ -45,6 +45,9 @@ class SessionStateV2:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     closing: bool = field(default=False, repr=False, compare=False)
     tree: SessionTree = field(default_factory=SessionTree)
+    # What the tokenizer recorded when the first generation committed
+    # (``TITOTokenizer.session_args_after_first_turn``); later turns render alike.
+    session_args: dict[str, Any] = field(default_factory=dict)
 
     def latest(self) -> TrajectoryNode | None:
         """The most recently committed generation (always a leaf), or ``None``
@@ -185,13 +188,20 @@ class SessionRegistryV2(SessionRegistry):
         self.sessions[session_id] = SessionStateV2()
         return session_id
 
-    def compute_mismatch(self, messages: list[dict[str, Any]], token_ids: list[int], tools: Any) -> list[dict] | None:
+    def compute_mismatch(
+        self,
+        messages: list[dict[str, Any]],
+        token_ids: list[int],
+        tools: Any,
+        *,
+        session_args: dict[str, Any],
+    ) -> list[dict] | None:
         """Compare accumulated token IDs against canonical chat template
-        output for one path. Read-only."""
+        output for one path, rendered as the session's first turn was. Read-only."""
         if not token_ids:
             return None
         try:
-            expected_ids = self.tito_tokenizer.apply_chat_template(
+            expected_ids = self.tito_tokenizer.for_session(session_args).apply_chat_template(
                 messages,
                 tools=tools,
                 add_generation_prompt=False,
@@ -207,4 +217,6 @@ class SessionRegistryV2(SessionRegistry):
         node = state.latest()
         if node is None:
             return None
-        return self.compute_mismatch(node.path_messages(), node.token_ids, node.record.request.get("tools"))
+        return self.compute_mismatch(
+            node.path_messages(), node.token_ids, node.record.request.get("tools"), session_args=state.session_args
+        )

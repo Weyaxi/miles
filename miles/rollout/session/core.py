@@ -24,6 +24,7 @@ from miles.rollout.session.errors import (
     UpstreamResponseError,
 )
 from miles.rollout.session.linear_trajectory import SessionRegistry
+from miles.rollout.session.request_rules import Rule, apply_rules, chat_request_rules
 from miles.rollout.session.samples.codec import encode_samples
 from miles.rollout.session.samples.merge import (
     compute_samples_from_openai_records,
@@ -31,7 +32,7 @@ from miles.rollout.session.samples.merge import (
     truncate_samples_by_total_tokens,
 )
 from miles.rollout.session.types import GetSessionResponse, SessionRecord
-from miles.utils.lora import LORA_ADAPTER_NAME, is_lora_enabled
+from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -156,55 +157,62 @@ def proxy_result_to_response(result: dict) -> Response:
     return Response(content=_render_json(data), status_code=status_code, headers=headers, media_type=JSON_MEDIA_TYPE)
 
 
-def prepare_chat_request(body: bytes, args, tito_tokenizer) -> tuple:
-    """Parse and normalize a chat request body — the session-independent half
-    of chat dispatch, shared verbatim by the v1 and v2 cores. Returns
-    ``(request_body, client_stream, tito_tokenizer)``; the tokenizer may be a
-    request-scoped clone.
+@dataclass
+class PreparedChatRequest:
+    """``prepare_chat_request`` output: the outbound body before the session adds
+    its rendered ``input_ids``, the client's streaming intent, and the renderer
+    for this request."""
+
+    body: dict
+    client_stream: bool
+    tito_tokenizer: TITOTokenizer
+
+
+def prepare_chat_request(
+    body: bytes,
+    tito_tokenizer: TITOTokenizer,
+    *,
+    rules: dict[str, Rule],
+    session_args: dict,
+) -> PreparedChatRequest:
+    """Parse a chat request body and decide its outbound arguments — the
+    session-independent half of chat dispatch, shared verbatim by the v1 and
+    v2 cores.
+
+    Body fields follow ``rules`` (``request_rules.chat_request_rules``): a
+    field named there is the server's, everything else is the client's and is
+    forwarded as sent.  ``chat_template_kwargs`` are decided by the tokenizer
+    (``TITOTokenizer.for_request``) against what the session recorded on its
+    first committed turn (``session_args``).
     """
     try:
-        request_body = json.loads(body) if body else {}
+        client = json.loads(body) if body else {}
     except json.JSONDecodeError as e:
         raise MessageValidationError(f"invalid JSON body: {e}") from e
 
     # Fake streaming: the backend must stay non-streaming (TITO needs the
-    # complete message + meta_info, and sglang rejects return_meta_info
-    # with stream=true), so pop the client's intent here and honor it
-    # when rendering the client response.
-    client_stream = bool(request_body.pop("stream", False))
-    request_body.pop("stream_options", None)
+    # complete message + meta_info, and sglang rejects return_meta_info with
+    # stream=true), so pop the client's intent here and honor it when
+    # rendering the client response.
+    client_stream = bool(client.pop("stream", False))
+    client.pop("stream_options", None)
 
-    # TITO token tracking needs Miles-owned input_ids plus SGLang output
-    # metadata: logprobs=True populates meta_info.output_token_logprobs and
-    # return_meta_info wraps it in choice.meta_info. Hardcoded (not
-    # setdefault) so agent-side overrides cannot break token accumulation.
-    request_body["logprobs"] = True
-    request_body["return_meta_info"] = True
-    if getattr(args, "use_rollout_routing_replay", False):
-        request_body["return_routed_experts"] = True
-    if getattr(args, "use_rollout_indexer_replay", False):
-        request_body["return_indexer_topk"] = True
-    # Must be False so stop-token text is trimmed from assistant content;
-    # token IDs still come from logprobs below.
-    request_body["no_stop_trim"] = False
-    # Serve the adapter being trained instead of the base weights.
-    if is_lora_enabled(args):
-        request_body["lora_path"] = LORA_ADAPTER_NAME
-    # FIXME(session): Only nested `chat_template_kwargs` reach the local renderer;
-    # top-level `reasoning` and `reasoning_effort` are not mapped to template kwargs.
-    request_ctk = request_body.get("chat_template_kwargs")
-    if request_ctk is not None and not isinstance(request_ctk, dict):
-        raise MessageValidationError("chat_template_kwargs must be an object")
-    if request_ctk:
-        try:
-            tito_tokenizer = tito_tokenizer.clone_with_chat_template_kwargs(request_ctk)
-        except ValueError as e:
-            raise MessageValidationError(str(e)) from e
-    if tito_tokenizer.chat_template_kwargs:
-        request_body["chat_template_kwargs"] = dict(tito_tokenizer.chat_template_kwargs)
-    else:
-        request_body.pop("chat_template_kwargs", None)
-    return request_body, client_stream, tito_tokenizer
+    if rules["lora_path"].value is not None and ":" in str(client.get("model") or ""):
+        # SGLang lets a ``base:adapter`` model parameter beat ``lora_path``.
+        raise MessageValidationError(
+            "model must not name a LoRA adapter; the session server serves the trained adapter"
+        )
+
+    try:
+        renderer = tito_tokenizer.for_request(client, session_args=session_args)
+    except ValueError as e:
+        raise MessageValidationError(str(e)) from e
+
+    wire = apply_rules({key: value for key, value in client.items() if key != "chat_template_kwargs"}, rules)
+    if renderer.chat_template_kwargs:
+        # The wire carries the effective dict the renderer uses, so both sides render alike.
+        wire["chat_template_kwargs"] = dict(renderer.chat_template_kwargs)
+    return PreparedChatRequest(body=wire, client_stream=client_stream, tito_tokenizer=renderer)
 
 
 def extract_completion(result: dict) -> tuple:
@@ -261,6 +269,7 @@ class SessionCore:
         # Derived from pause_generation_mode at server bootstrap; session code
         # must depend on this capability, never on the weight-update mode.
         self.use_addition_r3 = use_addition_r3
+        self.rules = chat_request_rules(config)
 
     def _maybe_request_addition_r3(
         self, request_body: dict, checkpoint_token_ids: list[int], prompt_token_ids: list[int]
@@ -305,6 +314,7 @@ class SessionCore:
             metadata["tito_session_mismatch"] = mismatch
         metadata["accumulated_token_ids"] = session.token_ids
         metadata["max_trim_tokens"] = self.registry.tito_tokenizer.max_trim_tokens
+        metadata["session_args"] = session.session_args
         return metadata
 
     async def get_session(self, session_id: str) -> Response:
@@ -379,8 +389,13 @@ class SessionCore:
             if session.closing:
                 raise SessionNotFoundError(f"session not found: session_id={session_id}")
 
-            request_body, client_stream, tito_tokenizer = prepare_chat_request(
-                body, self.config, self.registry.tito_tokenizer
+            prepared = prepare_chat_request(
+                body, self.registry.tito_tokenizer, rules=self.rules, session_args=session.session_args
+            )
+            request_body, client_stream, tito_tokenizer = (
+                prepared.body,
+                prepared.client_stream,
+                prepared.tito_tokenizer,
             )
 
             request_messages = request_body.get("messages", [])
@@ -433,6 +448,14 @@ class SessionCore:
                 )
                 return _chat_client_response(result, response, client_stream)
 
+            turn_args = tito_tokenizer.session_args_after_first_turn(response)
+            if session.session_args and session.session_args != turn_args:
+                logger.warning(
+                    f"Session {session_id} recorded different session args during proxy "
+                    f"(recorded={session.session_args}, request={turn_args}), skipping state update"
+                )
+                return _chat_client_response(result, response, client_stream)
+
             stored_request_messages = tito_tokenizer.preserve_server_message_state(
                 session.messages,
                 request_messages,
@@ -444,6 +467,9 @@ class SessionCore:
                 completion_token_ids=completion_token_ids,
                 max_trim_tokens=self.registry.tito_tokenizer.max_trim_tokens,
             )
+            if not session.session_args:
+                # The first committed turn fixes what later turns must render alike.
+                session.session_args = turn_args
 
             record = SessionRecord(
                 timestamp=time.time(),

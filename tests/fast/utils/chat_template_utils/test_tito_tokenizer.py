@@ -281,6 +281,59 @@ class TestConfig:
         assert comp._trim_trailing_ids == set(qwen3_tito.trailing_token_ids)
 
 
+class TestSessionRequestKwargs:
+    """``for_request`` / ``for_session`` / ``session_args_after_first_turn``: the
+    renderer a session-server request gets and what the session keeps from its
+    first committed turn."""
+
+    def test_first_turn_merges_request_kwargs_over_the_launch_and_records_them(self):
+        launch = TITOTokenizer(MagicMock(), chat_template_kwargs={"enable_thinking": False})
+
+        renderer = launch.for_request({"chat_template_kwargs": {"enable_thinking": True}}, session_args={})
+
+        assert renderer.chat_template_kwargs == {"enable_thinking": True}
+        assert renderer.session_args_after_first_turn({"id": "r1"}) == {
+            "chat_template_kwargs": {"enable_thinking": True}
+        }
+
+    def test_request_without_kwargs_renders_like_the_launch(self):
+        launch = TITOTokenizer(MagicMock(), chat_template_kwargs={"enable_thinking": False})
+        renderer = launch.for_request({"messages": []}, session_args={})
+        assert renderer.chat_template_kwargs == {"enable_thinking": False}
+        assert launch.for_session({}) is launch
+
+    def test_non_object_kwargs_are_refused(self):
+        with pytest.raises(ValueError, match="chat_template_kwargs must be an object"):
+            TITOTokenizer(MagicMock()).for_request({"chat_template_kwargs": "oops"}, session_args={})
+
+    def test_recorded_kwargs_are_inherited_and_fixed(self):
+        launch = TITOTokenizer(MagicMock(), chat_template_kwargs={"enable_thinking": False})
+        recorded = {"chat_template_kwargs": {"enable_thinking": True}}
+
+        assert launch.for_session(recorded).chat_template_kwargs == {"enable_thinking": True}
+        assert launch.for_request({}, session_args=recorded).chat_template_kwargs == {"enable_thinking": True}
+        same = launch.for_request({"chat_template_kwargs": {"enable_thinking": True}}, session_args=recorded)
+        assert same.chat_template_kwargs == {"enable_thinking": True}
+        with pytest.raises(ValueError, match="on its first turn"):
+            launch.for_request({"chat_template_kwargs": {"enable_thinking": False}}, session_args=recorded)
+
+    def test_family_constants_are_kept_and_a_conflict_is_refused(self, qwen3_tito: Qwen3TITOTokenizer):
+        renderer = qwen3_tito.for_request({"chat_template_kwargs": {"enable_thinking": True}}, session_args={})
+        assert renderer.chat_template_kwargs == {"clear_thinking": False, "enable_thinking": True}
+        with pytest.raises(ValueError, match="conflicts with the value registered"):
+            qwen3_tito.for_request({"chat_template_kwargs": {"clear_thinking": True}}, session_args={})
+
+    @pytest.mark.parametrize("tito_cls", [DeepSeekV32TITOTokenizer, DeepSeekV4TITOTokenizer])
+    def test_deepseek_alias_group_is_replaced_as_a_whole(self, tito_cls):
+        tokenizer = MagicMock()
+        tokenizer.convert_tokens_to_ids.return_value = 1
+        launch = tito_cls(tokenizer, chat_template_kwargs={"enable_thinking": False})
+
+        renderer = launch.for_request({"chat_template_kwargs": {"thinking": True}}, session_args={})
+
+        assert renderer.chat_template_kwargs == {"drop_thinking": False, "thinking": True}
+
+
 class TestCompletionPostprocess:
     def test_default_returns_upstream_message_unchanged(self):
         tito = TITOTokenizer(MagicMock())

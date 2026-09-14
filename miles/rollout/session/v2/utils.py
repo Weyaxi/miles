@@ -53,7 +53,8 @@ def build_leaf_material(
 
     Leaves whose turns all truncate away are dropped. Each sample's metadata
     carries the ``leaf`` descriptor plus the flat TITO bookkeeping keys for
-    the downstream pick/post-process hooks.
+    the downstream pick/post-process hooks (the per-leaf counterpart of the
+    session metadata a v1 sample receives whole).
 
     With ``use_addition_r3``, each record along a path carries only its
     additional R3 rows; the per-leaf assembler materializes the required prefix
@@ -82,6 +83,7 @@ def build_leaf_material(
         tools = path[-1].record.request.get("tools")
         flat: dict[str, Any] = {
             "accumulated_token_ids": list(leaf.token_ids),
+            "session_args": state.session_args,
             "leaf": {
                 "node_id": leaf.seq,
                 "parent": leaf.parent.seq if leaf.parent is not None else None,
@@ -90,7 +92,12 @@ def build_leaf_material(
             },
         }
         try:
-            mismatch = registry.compute_mismatch(leaf.path_messages(), leaf.token_ids, tools)
+            mismatch = registry.compute_mismatch(
+                leaf.path_messages(),
+                leaf.token_ids,
+                tools,
+                session_args=state.session_args,
+            )
         except TokenizationError:
             logger.exception("Failed to compute tito_session_mismatch for session %s", session_id)
             mismatch = None

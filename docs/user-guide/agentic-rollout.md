@@ -121,12 +121,26 @@ sequence, trims model-specific boundary tokens, and builds the training sample.
 
 <Warning>
 
-**Do not set TITO control fields.** The session server replaces client
-`input_ids` and forces `logprobs=True`, `return_meta_info=True`, and the response
-metadata needed for TITO. Do not set `logprob_start_len=0`; scoring the entire
-prompt defeats prefix caching and hurts performance.
+**Do not set TITO control fields.** The session server owns `input_ids`,
+`routed_experts_start_len`, `logprob_start_len`, and `lora_path`; a request that
+sets any of them is rejected with HTTP 400. It also forces `logprobs=True`,
+`return_meta_info=True`, and the response metadata needed for TITO, overriding
+client values.
 
 </Warning>
+
+### Choose template options per session
+
+`chat_template_kwargs` in a request are merged over the launch
+`--apply-chat-template-kwargs` for that turn, both in the locally rendered
+`input_ids` and in the request sent to SGLang. A family's fixed kwargs (for example
+`preserve_thinking=true`) cannot be changed and return HTTP 400.
+
+After the first successful turn the session records the effective template kwargs
+(shown as `session_args` in the `GET /sessions/{id}` metadata). Later turns may omit
+them and inherit the recorded values; a turn that would render differently is
+rejected with HTTP 400, because the stored token history was rendered under the
+recorded configuration.
 
 ### Choose the session behavior
 
