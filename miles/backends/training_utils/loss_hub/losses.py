@@ -4,7 +4,7 @@ from typing import Protocol
 
 import torch
 
-from miles.backends.training_utils.cp_utils import (
+from miles.backends.training_utils.data.context_parallel import (
     all_gather_with_cp,
     get_local_response_loss_masks,
     get_sum_of_sample_mean,

@@ -12,7 +12,7 @@ from transformers import PretrainedConfig, PreTrainedTokenizerBase
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
 from miles.backends.training_utils.ci_utils import check_grad_norm
-from miles.backends.training_utils.data import DataIterator, get_batch, get_data_iterator, get_rollout_data
+from miles.backends.training_utils.data.rollout import DataIterator, get_batch, get_data_iterator, get_rollout_data
 from miles.backends.training_utils.log_utils import (
     aggregate_forward_results,
     aggregate_train_losses,
