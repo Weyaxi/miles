@@ -12,11 +12,10 @@ from miles.rollout.session.core import (
     _render_json,
     _samples_response,
     extract_completion,
-    parse_chat_request,
-    prepare_chat_request,
     proxy_result_to_response,
 )
 from miles.rollout.session.errors import SessionNotFoundError, TokenizationError
+from miles.rollout.session.request_args import parse_chat_request, prepare_chat_request
 from miles.rollout.session.samples.codec import COMPUTED_FIELDS_V2, encode_samples
 from miles.rollout.session.types import GetSessionResponse, SessionRecord
 from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY, build_session_rollout_metrics
@@ -167,7 +166,7 @@ class SessionCoreV2(SessionCore):
             prepared = prepare_chat_request(
                 client,
                 self.registry.tito_tokenizer,
-                rules=self.rules,
+                config=self.config,
                 turn_args=attach_parent.turn_args if attach_parent is not None else {},
             )
             request_body, tito_tokenizer = prepared.body, prepared.tito_tokenizer

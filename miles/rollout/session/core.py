@@ -17,14 +17,9 @@ from starlette.responses import Response
 
 from miles.rollout.generate_utils.sample_utils import merge_samples
 from miles.rollout.session.config import SessionServerConfig
-from miles.rollout.session.errors import (
-    MessageValidationError,
-    SessionNotFoundError,
-    TokenizationError,
-    UpstreamResponseError,
-)
+from miles.rollout.session.errors import SessionNotFoundError, TokenizationError, UpstreamResponseError
 from miles.rollout.session.linear_trajectory import SessionRegistry
-from miles.rollout.session.request_rules import Rule, apply_rules, chat_request_rules
+from miles.rollout.session.request_args import parse_chat_request, prepare_chat_request
 from miles.rollout.session.samples.codec import encode_samples
 from miles.rollout.session.samples.merge import (
     compute_samples_from_openai_records,
@@ -32,7 +27,6 @@ from miles.rollout.session.samples.merge import (
     truncate_samples_by_total_tokens,
 )
 from miles.rollout.session.types import GetSessionResponse, SessionRecord
-from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -157,67 +151,6 @@ def proxy_result_to_response(result: dict) -> Response:
     return Response(content=_render_json(data), status_code=status_code, headers=headers, media_type=JSON_MEDIA_TYPE)
 
 
-def parse_chat_request(body: bytes) -> tuple[dict, bool]:
-    """Parse a chat request body into the client's dict and its streaming intent.
-
-    Fake streaming: the backend must stay non-streaming (TITO needs the
-    complete message + meta_info, and sglang rejects return_meta_info with
-    stream=true), so the client's intent is popped here and honored when
-    rendering the client response.
-    """
-    try:
-        client = json.loads(body) if body else {}
-    except json.JSONDecodeError as e:
-        raise MessageValidationError(f"invalid JSON body: {e}") from e
-    client_stream = bool(client.pop("stream", False))
-    client.pop("stream_options", None)
-    return client, client_stream
-
-
-@dataclass
-class PreparedChatRequest:
-    """``prepare_chat_request`` output: the outbound body before the session adds
-    its rendered ``input_ids``, and the renderer for this request."""
-
-    body: dict
-    tito_tokenizer: TITOTokenizer
-
-
-def prepare_chat_request(
-    client: dict,
-    tito_tokenizer: TITOTokenizer,
-    *,
-    rules: dict[str, Rule],
-    turn_args: dict,
-) -> PreparedChatRequest:
-    """Decide the outbound arguments of a parsed chat request — the
-    session-independent half of chat dispatch, shared verbatim by the v1 and
-    v2 cores.  Raises before any session state changes.
-
-    Body fields follow ``rules`` (``request_rules.chat_request_rules``): a
-    field named there is the server's, everything else is the client's and is
-    forwarded as sent.  ``chat_template_kwargs`` are decided by the tokenizer
-    (``TITOTokenizer.for_request``) against ``turn_args``, what the turn this
-    request continues recorded when it committed (empty for a new root).
-    """
-    if rules["lora_path"].value is not None and ":" in str(client.get("model") or ""):
-        # SGLang lets a ``base:adapter`` model parameter beat ``lora_path``.
-        raise MessageValidationError(
-            "model must not name a LoRA adapter; the session server serves the trained adapter"
-        )
-
-    try:
-        renderer = tito_tokenizer.for_request(client, turn_args=turn_args)
-    except ValueError as e:
-        raise MessageValidationError(str(e)) from e
-
-    wire = apply_rules({key: value for key, value in client.items() if key != "chat_template_kwargs"}, rules)
-    if renderer.chat_template_kwargs:
-        # The wire carries the effective dict the renderer uses, so both sides render alike.
-        wire["chat_template_kwargs"] = dict(renderer.chat_template_kwargs)
-    return PreparedChatRequest(body=wire, tito_tokenizer=renderer)
-
-
 def extract_completion(result: dict) -> tuple:
     """Decode and validate the backend chat response — shared verbatim by the
     v1 and v2 cores. Returns ``(response, choice, assistant_message,
@@ -272,7 +205,6 @@ class SessionCore:
         # Derived from pause_generation_mode at server bootstrap; session code
         # must depend on this capability, never on the weight-update mode.
         self.use_addition_r3 = use_addition_r3
-        self.rules = chat_request_rules(config)
 
     def _maybe_request_addition_r3(
         self, request_body: dict, checkpoint_token_ids: list[int], prompt_token_ids: list[int]
@@ -399,7 +331,7 @@ class SessionCore:
             prepared = prepare_chat_request(
                 client,
                 self.registry.tito_tokenizer,
-                rules=self.rules,
+                config=self.config,
                 turn_args=session.turn_args_for_request(
                     request_messages, message_matcher=self.registry.message_matcher
                 ),

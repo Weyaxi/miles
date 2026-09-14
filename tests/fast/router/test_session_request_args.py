@@ -1,7 +1,7 @@
 """HTTP-level tests for how the session server decides outbound chat-request arguments.
 
-Body fields: ``request_rules.chat_request_rules`` (what the server owns, what it
-rejects, what it forwards).  ``chat_template_kwargs``: ``TITOTokenizer.for_request``
+Body fields: ``request_args.decide_chat_request_args`` (what the server owns, what
+it rejects, what it forwards).  ``chat_template_kwargs``: ``TITOTokenizer.for_request``
 against the ``turn_args`` recorded by the turn a request continues.
 """
 

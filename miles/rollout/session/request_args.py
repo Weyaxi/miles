@@ -1,0 +1,152 @@
+"""How one session-server chat request becomes the request sent to SGLang.
+
+The whole decision lives in this module, in the order it runs:
+
+1. ``parse_chat_request``: bytes to the client's dict; the fake-streaming
+   flag is popped here and honored when the reply is rendered.
+2. ``decide_chat_request_args``: the body, field by field.  Every field named
+   there is the server's: ``server_first`` replaces a differing client value
+   and logs why, ``server_strict`` refuses it with HTTP 400.  A field named
+   nowhere is the client's and is forwarded as sent (sampling parameters,
+   ``model``, ``messages``, ``tools``, unknown keys).
+3. ``TITOTokenizer.for_request``: the renderer, and with it the effective
+   ``chat_template_kwargs``, chosen by the tokenizer family against the
+   ``turn_args`` recorded by the turn this request continues (empty for a new
+   root).  The renderer's effective kwargs are what goes on the wire.
+
+``prepare_chat_request`` runs steps 2 and 3 and returns the body the session
+then completes with its rendered ``input_ids``.  The core looks up
+``turn_args`` (v1 rollback target, v2 attach point) read-only before calling
+it, so a rejected request never changes session state.
+"""
+
+import json
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+from miles.rollout.session.config import SessionServerConfig
+from miles.rollout.session.errors import MessageValidationError
+from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizer
+from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
+
+logger = logging.getLogger(__name__)
+
+
+def parse_chat_request(body: bytes) -> tuple[dict[str, Any], bool]:
+    """Parse a chat request body into the client's dict and its streaming intent.
+
+    Fake streaming: the backend must stay non-streaming (TITO needs the
+    complete message + meta_info, and sglang rejects return_meta_info with
+    stream=true), so the client's intent is popped here and honored when
+    rendering the client response.
+    """
+    try:
+        client = json.loads(body) if body else {}
+    except json.JSONDecodeError as e:
+        raise MessageValidationError(f"invalid JSON body: {e}") from e
+    client_stream = bool(client.pop("stream", False))
+    client.pop("stream_options", None)
+    return client, client_stream
+
+
+@dataclass
+class PreparedChatRequest:
+    """``prepare_chat_request`` output: the outbound body before the session adds
+    its rendered ``input_ids``, and the renderer for this request."""
+
+    body: dict[str, Any]
+    tito_tokenizer: TITOTokenizer
+
+
+def prepare_chat_request(
+    client: dict[str, Any],
+    tito_tokenizer: TITOTokenizer,
+    *,
+    config: SessionServerConfig,
+    turn_args: dict[str, Any],
+) -> PreparedChatRequest:
+    """Decide the outbound arguments of a parsed chat request; shared verbatim
+    by the v1 and v2 cores.  Raises (HTTP 400) before any session state changes.
+
+    ``turn_args`` is what the turn this request continues recorded when it
+    committed (``TITOTokenizer.turn_args_for_commit``), empty for a new root.
+    """
+    wire = decide_chat_request_args(client, config)
+    try:
+        renderer = tito_tokenizer.for_request(client, turn_args=turn_args)
+    except ValueError as e:
+        raise MessageValidationError(str(e)) from e
+    if renderer.chat_template_kwargs:
+        # The wire carries the effective dict the renderer uses, so both sides render alike.
+        wire["chat_template_kwargs"] = dict(renderer.chat_template_kwargs)
+    else:
+        wire.pop("chat_template_kwargs", None)
+    return PreparedChatRequest(body=wire, tito_tokenizer=renderer)
+
+
+def decide_chat_request_args(client: dict[str, Any], config: SessionServerConfig) -> dict[str, Any]:
+    """The outbound ``/v1/chat/completions`` body: the client's fields as sent,
+    then every field the session server decides.  Client key order is kept;
+    fields the client did not send follow."""
+    wire = dict(client)
+
+    # TITO needs these on every request: agent-side overrides would break token accumulation.
+    server_first(wire, "logprobs", True, why="TITO reads meta_info.output_token_logprobs")
+    server_first(wire, "return_meta_info", True, why="wraps output_token_logprobs in choice.meta_info")
+    server_first(wire, "no_stop_trim", False, why="stop-token text is trimmed; token ids come from logprobs")
+
+    # R3 replay follows the launch flags, on or off.
+    server_first(
+        wire,
+        "return_routed_experts",
+        bool(config.use_rollout_routing_replay),
+        why="follows --use-rollout-routing-replay",
+    )
+    server_first(
+        wire,
+        "return_indexer_topk",
+        bool(config.use_rollout_indexer_replay),
+        why="follows --use-rollout-indexer-replay",
+    )
+
+    # The served adapter is selected by training; SGLang lets a ``base:adapter``
+    # model parameter beat ``lora_path``, so that spelling is refused too.
+    lora_path = LORA_ADAPTER_NAME if lora_rollout_enabled(config) else None
+    server_strict(wire, "lora_path", lora_path, why="the served adapter is selected by training")
+    if lora_path is not None and ":" in str(wire.get("model") or ""):
+        raise MessageValidationError(
+            "model must not name a LoRA adapter; the session server serves the trained adapter"
+        )
+
+    # A client setting these has passed out-of-scope information: fail loud.
+    server_strict(wire, "input_ids", None, why="TITO token ids are rendered by the session server")
+    server_strict(wire, "routed_experts_start_len", None, why="R3 offsets are computed by the session server")
+    server_strict(wire, "logprob_start_len", None, why="not supported on the session chat path")
+    return wire
+
+
+def server_first(wire: dict[str, Any], name: str, value: Any, *, why: str) -> None:
+    """Set ``wire[name]`` to the server's ``value``; a differing client value is
+    replaced and logged with ``why``.  ``value=None`` takes the field off the wire.
+    A client value of ``None`` counts as not sent."""
+    sent = wire.get(name)
+    if sent is not None and sent != value:
+        logger.warning("%s=%r from the client replaced by %r: %s", name, sent, value, why)
+    if value is None:
+        wire.pop(name, None)
+    else:
+        wire[name] = value
+
+
+def server_strict(wire: dict[str, Any], name: str, value: Any, *, why: str) -> None:
+    """Set ``wire[name]`` to the server's ``value``; a differing client value is
+    rejected with HTTP 400 quoting ``why``.  ``value=None`` means the client may
+    not send the field at all.  A client value of ``None`` counts as not sent."""
+    sent = wire.get(name)
+    if sent is not None and sent != value:
+        raise MessageValidationError(f"{name}={sent!r} is not accepted: {why}")
+    if value is None:
+        wire.pop(name, None)
+    else:
+        wire[name] = value
