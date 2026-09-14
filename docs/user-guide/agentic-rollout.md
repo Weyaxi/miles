@@ -136,11 +136,13 @@ client values.
 `input_ids` and in the request sent to SGLang. A family's fixed kwargs (for example
 `preserve_thinking=true`) cannot be changed and return HTTP 400.
 
-After the first successful turn the session records the effective template kwargs
-(shown as `session_args` in the `GET /sessions/{id}` metadata). Later turns may omit
-them and inherit the recorded values; a turn that would render differently is
-rejected with HTTP 400, because the stored token history was rendered under the
-recorded configuration.
+Each committed turn records the template kwargs it was rendered with. A request
+that continues that turn inherits them when it omits `chat_template_kwargs`, and is
+rejected with HTTP 400 when it would render differently, because the token history
+it continues was rendered under them. A request that starts a new root (a v2 branch
+from the first message, or a v1 retry of the first turn) may choose again.
+`GET /sessions/{id}` reports the kwargs of the turn its records end with as `turn_args` in the metadata;
+under v2 each `tree.nodes` entry carries its own.
 
 ### Choose the session behavior
 

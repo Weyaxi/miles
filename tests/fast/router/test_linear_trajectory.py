@@ -958,11 +958,17 @@ class TestComputeSessionMismatch:
         assert kwargs["tools"] == tools
         assert kwargs["add_generation_prompt"] is False
 
-    def test_renders_with_the_kwargs_recorded_in_session_args(self, registry: SessionRegistry):
+    def test_renders_with_the_kwargs_the_tip_recorded(self, registry: SessionRegistry):
         sid = registry.create_session()
         session = registry.get_session(sid)
-        session.update_pretokenized_state([SYS_MSG, USER_MSG], ASSISTANT_MSG_1, [1, 2, 3], [10, 11], max_trim_tokens=0)
-        session.session_args = {"chat_template_kwargs": {"reasoning_effort": "low"}}
+        session.update_pretokenized_state(
+            [SYS_MSG, USER_MSG],
+            ASSISTANT_MSG_1,
+            [1, 2, 3],
+            [10, 11],
+            max_trim_tokens=0,
+            turn_args={"chat_template_kwargs": {"reasoning_effort": "low"}},
+        )
 
         seen_kwargs: list[dict] = []
 

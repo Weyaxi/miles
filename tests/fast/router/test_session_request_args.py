@@ -2,7 +2,7 @@
 
 Body fields: ``request_rules.chat_request_rules`` (what the server owns, what it
 rejects, what it forwards).  ``chat_template_kwargs``: ``TITOTokenizer.for_request``
-against the ``session_args`` the session records on its first committed turn.
+against the ``turn_args`` recorded by the turn a request continues.
 """
 
 import asyncio
@@ -123,41 +123,62 @@ class TestChatTemplateKwargs:
 
 
 @pytest.mark.parametrize("version", ["v1", "v2"])
-class TestSessionArgs:
-    """The first committed turn records ``session_args``; later turns render alike."""
+class TestTurnArgs:
+    """A committed turn records its kwargs; a request continuing it renders alike."""
 
     def _turn(self, env, session_id: str, messages: list, **extra) -> requests.Response:
         return _post_chat(env.url, session_id, {"messages": messages, **extra})
 
-    def test_first_commit_records_omitted_kwargs_inherit_and_changes_are_400(self, version):
+    def test_continuing_a_turn_inherits_omitted_kwargs_and_rejects_a_change(self, version):
         with _serve(version) as env:
             session_id = _create_session(env.url)
-            assert _metadata(env.url, session_id)["session_args"] == {}
+            assert _metadata(env.url, session_id)["turn_args"] == {}
 
             first = self._turn(env, session_id, [USER], chat_template_kwargs=THINKING_ON)
             assert first.status_code == 200
-            assert _metadata(env.url, session_id)["session_args"] == {"chat_template_kwargs": THINKING_ON}
+            assert _metadata(env.url, session_id)["turn_args"] == {"chat_template_kwargs": THINKING_ON}
             assistant = first.json()["choices"][0]["message"]
             history = [USER, assistant, {"role": "user", "content": "more"}]
 
             second = self._turn(env, session_id, history)
             assert second.status_code == 200
             assert env.backend.request_log[-1]["chat_template_kwargs"] == THINKING_ON
+            assert len(_records(env.url, session_id)) == 2
 
             third = self._turn(env, session_id, history, chat_template_kwargs=LAUNCH_KWARGS)
             assert third.status_code == 400
-            assert "on its first turn" in third.json()["error"]
+            assert "was rendered with" in third.json()["error"]
+            # A rejected request leaves the session untouched: no rollback, no view change.
+            assert len(_records(env.url, session_id)) == 2
 
             fourth = self._turn(env, session_id, history, chat_template_kwargs=THINKING_ON)
             assert fourth.status_code == 200
             # Retrying the same history: v1 rolls back one assistant step and re-appends
-            # (2 linear records); v2 commits the retry as a sibling node (3 nodes).
+            # (2 linear records); v2 commits the retry as another child (3 nodes).
             if version == "v1":
                 assert len(_records(env.url, session_id)) == 2
             else:
                 assert len(_metadata(env.url, session_id)["tree"]["nodes"]) == 3
 
-    def test_failed_first_turn_records_nothing(self, version):
+    def test_a_new_root_may_choose_again(self, version):
+        """v1: retrying the first turn rolls back to the empty checkpoint; v2: a second root."""
+        with _serve(version) as env:
+            session_id = _create_session(env.url)
+            assert self._turn(env, session_id, [USER], chat_template_kwargs=THINKING_ON).status_code == 200
+
+            again = self._turn(env, session_id, [USER])
+            assert again.status_code == 200
+            assert env.backend.request_log[-1]["chat_template_kwargs"] == LAUNCH_KWARGS
+            metadata = _metadata(env.url, session_id)
+            assert metadata["turn_args"] == {"chat_template_kwargs": LAUNCH_KWARGS}
+            if version == "v1":
+                assert len(_records(env.url, session_id)) == 1
+            else:
+                nodes = metadata["tree"]["nodes"]
+                assert [node["parent"] for node in nodes] == [None, None]
+                assert [node["turn_args"]["chat_template_kwargs"] for node in nodes] == [THINKING_ON, LAUNCH_KWARGS]
+
+    def test_failed_turn_records_nothing(self, version):
         original = MockSGLangServer._handle_generate_like_request
         calls = {"n": 0}
 
@@ -171,15 +192,14 @@ class TestSessionArgs:
             session_id = _create_session(env.url)
             with patch.object(MockSGLangServer, "_handle_generate_like_request", new=fail_first):
                 assert self._turn(env, session_id, [USER], chat_template_kwargs=THINKING_ON).status_code == 500
-                assert _metadata(env.url, session_id)["session_args"] == {}
+                assert _metadata(env.url, session_id)["turn_args"] == {}
                 assert self._turn(env, session_id, [USER]).status_code == 200
             assert env.backend.request_log[-1]["chat_template_kwargs"] == LAUNCH_KWARGS
-            assert _metadata(env.url, session_id)["session_args"] == {"chat_template_kwargs": LAUNCH_KWARGS}
-            assert self._turn(env, session_id, [USER], chat_template_kwargs=THINKING_ON).status_code == 400
+            assert _metadata(env.url, session_id)["turn_args"] == {"chat_template_kwargs": LAUNCH_KWARGS}
 
 
-def test_v2_concurrent_first_turns_with_different_kwargs_record_exactly_once():
-    """Both replies are served, only the first commit is recorded, and its kwargs become the session's."""
+def test_v2_concurrent_first_turns_with_different_kwargs_both_commit_as_roots():
+    """Neither first turn continues a recorded node, so both commit, each with its own kwargs."""
     with _serve("v2") as env:
         session_id = _create_session(env.url)
         arrivals = 0
@@ -206,12 +226,15 @@ def test_v2_concurrent_first_turns_with_different_kwargs_record_exactly_once():
                 responses = [future.result(timeout=10.0) for future in futures]
 
         assert all(response.status_code == 200 for response in responses)
-        records = _records(env.url, session_id)
-        assert len(records) == 1
-        recorded = records[0]["request"]["chat_template_kwargs"]
-        assert _metadata(env.url, session_id)["session_args"] == {"chat_template_kwargs": recorded}
+        nodes = _metadata(env.url, session_id)["tree"]["nodes"]
+        assert [node["parent"] for node in nodes] == [None, None]
+        assert sorted(node["turn_args"]["chat_template_kwargs"]["enable_thinking"] for node in nodes) == [False, True]
+
+        # Continuing either root must render like that root.
+        [record] = _records(env.url, session_id)  # the served chain: the root committed last
+        recorded = record["request"]["chat_template_kwargs"]
         other = LAUNCH_KWARGS if recorded == THINKING_ON else THINKING_ON
-        assistant = records[0]["response"]["choices"][0]["message"]
+        assistant = record["response"]["choices"][0]["message"]
         history = [USER, assistant, {"role": "user", "content": "more"}]
         assert _post_chat(env.url, session_id, {"messages": history, "chat_template_kwargs": other}).status_code == 400
         assert (

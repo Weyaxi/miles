@@ -12,6 +12,7 @@ from miles.rollout.session.core import (
     _render_json,
     _samples_response,
     extract_completion,
+    parse_chat_request,
     prepare_chat_request,
     proxy_result_to_response,
 )
@@ -59,7 +60,7 @@ class SessionCoreV2(SessionCore):
         metadata["accumulated_token_ids"] = latest.token_ids if latest is not None else []
         metadata["max_trim_tokens"] = self.registry.tito_tokenizer.max_trim_tokens
         metadata["tree"] = tree_metadata(session)
-        metadata["session_args"] = session.session_args
+        metadata["turn_args"] = latest.turn_args if latest is not None else {}
         return metadata
 
     async def get_session(self, session_id: str) -> Response:
@@ -156,19 +157,21 @@ class SessionCoreV2(SessionCore):
             if session.closing:
                 raise SessionNotFoundError(f"session not found: session_id={session_id}")
 
-            prepared = prepare_chat_request(
-                body, self.registry.tito_tokenizer, rules=self.rules, session_args=session.session_args
-            )
-            request_body, client_stream, tito_tokenizer = (
-                prepared.body,
-                prepared.client_stream,
-                prepared.tito_tokenizer,
-            )
-
-            request_messages = request_body.get("messages", [])
+            client, client_stream = parse_chat_request(body)
+            request_messages = client.get("messages", [])
+            # Attaching is a pure lookup: the renderer follows the node this request
+            # continues, and a rejected request leaves the session untouched.
             attach_parent = attach_point_for_request(
                 session, request_messages, message_matcher=self.registry.message_matcher
             ).node
+            prepared = prepare_chat_request(
+                client,
+                self.registry.tito_tokenizer,
+                rules=self.rules,
+                turn_args=attach_parent.turn_args if attach_parent is not None else {},
+            )
+            request_body, tito_tokenizer = prepared.body, prepared.tito_tokenizer
+
             prompt_token_ids = prepare_pretokenized(
                 attach_parent,
                 request_messages,
@@ -208,16 +211,6 @@ class SessionCoreV2(SessionCore):
                 logger.warning(f"Session {session_id} closed during proxy, skipping state update")
                 return _chat_client_response(result, response, client_stream)
 
-            turn_args = tito_tokenizer.session_args_after_first_turn(response)
-            if session.session_args and session.session_args != turn_args:
-                # A concurrent first turn that renders differently committed first; the
-                # reply is still served, but this turn is not part of the session.
-                logger.warning(
-                    f"Session {session_id} recorded different session args during proxy "
-                    f"(recorded={session.session_args}, request={turn_args}), skipping commit"
-                )
-                return _chat_client_response(result, response, client_stream)
-
             record = SessionRecord(
                 timestamp=time.time(),
                 request_timestamp=request_timestamp,
@@ -238,10 +231,8 @@ class SessionCoreV2(SessionCore):
                 record=record,
                 response_id=response.get("id", ""),
                 finish_reason=choice.get("finish_reason") or "",
+                turn_args=tito_tokenizer.turn_args_for_commit(response),
             )
-            if not session.session_args:
-                # The first committed turn fixes what later turns must render alike.
-                session.session_args = turn_args
         # --- lock released ---
 
         return _chat_client_response(result, response, client_stream)

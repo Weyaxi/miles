@@ -157,46 +157,49 @@ def proxy_result_to_response(result: dict) -> Response:
     return Response(content=_render_json(data), status_code=status_code, headers=headers, media_type=JSON_MEDIA_TYPE)
 
 
-@dataclass
-class PreparedChatRequest:
-    """``prepare_chat_request`` output: the outbound body before the session adds
-    its rendered ``input_ids``, the client's streaming intent, and the renderer
-    for this request."""
+def parse_chat_request(body: bytes) -> tuple[dict, bool]:
+    """Parse a chat request body into the client's dict and its streaming intent.
 
-    body: dict
-    client_stream: bool
-    tito_tokenizer: TITOTokenizer
-
-
-def prepare_chat_request(
-    body: bytes,
-    tito_tokenizer: TITOTokenizer,
-    *,
-    rules: dict[str, Rule],
-    session_args: dict,
-) -> PreparedChatRequest:
-    """Parse a chat request body and decide its outbound arguments — the
-    session-independent half of chat dispatch, shared verbatim by the v1 and
-    v2 cores.
-
-    Body fields follow ``rules`` (``request_rules.chat_request_rules``): a
-    field named there is the server's, everything else is the client's and is
-    forwarded as sent.  ``chat_template_kwargs`` are decided by the tokenizer
-    (``TITOTokenizer.for_request``) against what the session recorded on its
-    first committed turn (``session_args``).
+    Fake streaming: the backend must stay non-streaming (TITO needs the
+    complete message + meta_info, and sglang rejects return_meta_info with
+    stream=true), so the client's intent is popped here and honored when
+    rendering the client response.
     """
     try:
         client = json.loads(body) if body else {}
     except json.JSONDecodeError as e:
         raise MessageValidationError(f"invalid JSON body: {e}") from e
-
-    # Fake streaming: the backend must stay non-streaming (TITO needs the
-    # complete message + meta_info, and sglang rejects return_meta_info with
-    # stream=true), so pop the client's intent here and honor it when
-    # rendering the client response.
     client_stream = bool(client.pop("stream", False))
     client.pop("stream_options", None)
+    return client, client_stream
 
+
+@dataclass
+class PreparedChatRequest:
+    """``prepare_chat_request`` output: the outbound body before the session adds
+    its rendered ``input_ids``, and the renderer for this request."""
+
+    body: dict
+    tito_tokenizer: TITOTokenizer
+
+
+def prepare_chat_request(
+    client: dict,
+    tito_tokenizer: TITOTokenizer,
+    *,
+    rules: dict[str, Rule],
+    turn_args: dict,
+) -> PreparedChatRequest:
+    """Decide the outbound arguments of a parsed chat request — the
+    session-independent half of chat dispatch, shared verbatim by the v1 and
+    v2 cores.  Raises before any session state changes.
+
+    Body fields follow ``rules`` (``request_rules.chat_request_rules``): a
+    field named there is the server's, everything else is the client's and is
+    forwarded as sent.  ``chat_template_kwargs`` are decided by the tokenizer
+    (``TITOTokenizer.for_request``) against ``turn_args``, what the turn this
+    request continues recorded when it committed (empty for a new root).
+    """
     if rules["lora_path"].value is not None and ":" in str(client.get("model") or ""):
         # SGLang lets a ``base:adapter`` model parameter beat ``lora_path``.
         raise MessageValidationError(
@@ -204,7 +207,7 @@ def prepare_chat_request(
         )
 
     try:
-        renderer = tito_tokenizer.for_request(client, session_args=session_args)
+        renderer = tito_tokenizer.for_request(client, turn_args=turn_args)
     except ValueError as e:
         raise MessageValidationError(str(e)) from e
 
@@ -212,7 +215,7 @@ def prepare_chat_request(
     if renderer.chat_template_kwargs:
         # The wire carries the effective dict the renderer uses, so both sides render alike.
         wire["chat_template_kwargs"] = dict(renderer.chat_template_kwargs)
-    return PreparedChatRequest(body=wire, client_stream=client_stream, tito_tokenizer=renderer)
+    return PreparedChatRequest(body=wire, tito_tokenizer=renderer)
 
 
 def extract_completion(result: dict) -> tuple:
@@ -314,7 +317,7 @@ class SessionCore:
             metadata["tito_session_mismatch"] = mismatch
         metadata["accumulated_token_ids"] = session.token_ids
         metadata["max_trim_tokens"] = self.registry.tito_tokenizer.max_trim_tokens
-        metadata["session_args"] = session.session_args
+        metadata["turn_args"] = session.turn_args
         return metadata
 
     async def get_session(self, session_id: str) -> Response:
@@ -389,16 +392,20 @@ class SessionCore:
             if session.closing:
                 raise SessionNotFoundError(f"session not found: session_id={session_id}")
 
+            client, client_stream = parse_chat_request(body)
+            request_messages = client.get("messages", [])
+            # The renderer follows the checkpoint this request continues, read before
+            # the rollback below so a rejected request leaves the session untouched.
             prepared = prepare_chat_request(
-                body, self.registry.tito_tokenizer, rules=self.rules, session_args=session.session_args
+                client,
+                self.registry.tito_tokenizer,
+                rules=self.rules,
+                turn_args=session.turn_args_for_request(
+                    request_messages, message_matcher=self.registry.message_matcher
+                ),
             )
-            request_body, client_stream, tito_tokenizer = (
-                prepared.body,
-                prepared.client_stream,
-                prepared.tito_tokenizer,
-            )
+            request_body, tito_tokenizer = prepared.body, prepared.tito_tokenizer
 
-            request_messages = request_body.get("messages", [])
             prompt_token_ids = session.prepare_pretokenized(
                 request_messages,
                 tools=request_body.get("tools"),
@@ -448,14 +455,6 @@ class SessionCore:
                 )
                 return _chat_client_response(result, response, client_stream)
 
-            turn_args = tito_tokenizer.session_args_after_first_turn(response)
-            if session.session_args and session.session_args != turn_args:
-                logger.warning(
-                    f"Session {session_id} recorded different session args during proxy "
-                    f"(recorded={session.session_args}, request={turn_args}), skipping state update"
-                )
-                return _chat_client_response(result, response, client_stream)
-
             stored_request_messages = tito_tokenizer.preserve_server_message_state(
                 session.messages,
                 request_messages,
@@ -466,10 +465,8 @@ class SessionCore:
                 prompt_token_ids=prompt_token_ids,
                 completion_token_ids=completion_token_ids,
                 max_trim_tokens=self.registry.tito_tokenizer.max_trim_tokens,
+                turn_args=tito_tokenizer.turn_args_for_commit(response),
             )
-            if not session.session_args:
-                # The first committed turn fixes what later turns must render alike.
-                session.session_args = turn_args
 
             record = SessionRecord(
                 timestamp=time.time(),

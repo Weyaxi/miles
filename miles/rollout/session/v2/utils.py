@@ -31,6 +31,7 @@ def tree_metadata(state: SessionStateV2) -> dict:
             "completion_span": list(node.completion_span),
             "num_tokens": len(node.token_ids),
             "response_id": node.response_id,
+            "turn_args": node.turn_args,
         }
         for node in state.tree.nodes
     ]
@@ -83,7 +84,7 @@ def build_leaf_material(
         tools = path[-1].record.request.get("tools")
         flat: dict[str, Any] = {
             "accumulated_token_ids": list(leaf.token_ids),
-            "session_args": state.session_args,
+            "turn_args": leaf.turn_args,
             "leaf": {
                 "node_id": leaf.seq,
                 "parent": leaf.parent.seq if leaf.parent is not None else None,
@@ -96,7 +97,7 @@ def build_leaf_material(
                 leaf.path_messages(),
                 leaf.token_ids,
                 tools,
-                session_args=state.session_args,
+                turn_args=leaf.turn_args,
             )
         except TokenizationError:
             logger.exception("Failed to compute tito_session_mismatch for session %s", session_id)
