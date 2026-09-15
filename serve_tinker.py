@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from contextlib import AsyncExitStack
+from contextlib import suppress
 
 import uvicorn
 
@@ -33,56 +33,57 @@ async def serve(args):
     _worker_manager = launch_worker_manager(args)
     object_store.init_instance(args, contribute_segment=False)
 
-    async with AsyncExitStack() as cleanup:
-        inference_controller = InferenceController(args)
-        cleanup.push_async_callback(inference_controller.dispose)
-        await inference_controller.init()
+    inference_controller = InferenceController(args)
+    await inference_controller.init()
 
-        trainer = TrainerController(
-            args=args,
-            role="actor",
-            with_ref=False,
-            with_opd_teacher=False,
-            inference_controller=None,
-            rollout_executor=None,
-        )
-        cleanup.push_async_callback(trainer.dispose)
-        await trainer.init()
+    trainer = TrainerController(
+        args=args,
+        role="actor",
+        with_ref=False,
+        with_opd_teacher=False,
+        inference_controller=None,
+        rollout_executor=None,
+    )
+    await trainer.init()
 
-        target_modules = set(convert_target_modules_to_hf(args.target_modules))
-        config = GatewayConfig(
-            base_model=args.tinker_base_model or args.hf_checkpoint,
-            n_slots=args.multi_lora_n_adapters,
-            checkpoint_root=checkpoint_root,
-            lora_alpha=args.lora_alpha,
-            max_lora_rank=args.lora_rank,
-            trains_attn=bool(target_modules & {"q_proj", "k_proj", "v_proj", "o_proj"}),
-            trains_mlp=bool(target_modules & {"gate_proj", "up_proj", "down_proj"}),
-            trains_unembed="lm_head" in target_modules,
-        )
-        router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-        actor_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
-        dp_size = actor_world_size // (
-            args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
-        )
-        service = TinkerService(MilesBackend(trainer, router_url, dp_size=dp_size), config)
+    target_modules = set(convert_target_modules_to_hf(args.target_modules))
+    config = GatewayConfig(
+        base_model=args.tinker_base_model or args.hf_checkpoint,
+        n_slots=args.multi_lora_n_adapters,
+        checkpoint_root=checkpoint_root,
+        lora_alpha=args.lora_alpha,
+        max_lora_rank=args.lora_rank,
+        trains_attn=bool(target_modules & {"q_proj", "k_proj", "v_proj", "o_proj"}),
+        trains_mlp=bool(target_modules & {"gate_proj", "up_proj", "down_proj"}),
+        trains_unembed="lm_head" in target_modules,
+    )
+    router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+    actor_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+    dp_size = actor_world_size // (
+        args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
+    )
+    service = TinkerService(MilesBackend(trainer, router_url, dp_size=dp_size), config)
 
-        server = uvicorn.Server(
-            uvicorn.Config(build_app(service), host="0.0.0.0", port=args.tinker_server_port, log_level="info")
-        )
-        logger.info(f"tinker gateway serving {config.base_model} on :{args.tinker_server_port}")
-        # supervise both: a crashed dispatcher must take the HTTP server down with it,
-        # not keep answering /healthz while every training future pends forever
-        service_task = asyncio.create_task(service.run())
-        server_task = asyncio.create_task(server.serve())
-        try:
-            done, _ = await asyncio.wait({service_task, server_task}, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                task.result()
-        finally:
-            for task in (service_task, server_task):
-                task.cancel()
-            await asyncio.gather(service_task, server_task, return_exceptions=True)
+    server = uvicorn.Server(
+        uvicorn.Config(build_app(service), host="0.0.0.0", port=args.tinker_server_port, log_level="info")
+    )
+    logger.info(f"tinker gateway serving {config.base_model} on :{args.tinker_server_port}")
+    # supervise both: a crashed dispatcher must take the HTTP server down with it,
+    # not keep answering /healthz while every training future pends forever
+    service_task = asyncio.create_task(service.run())
+    server_task = asyncio.create_task(server.serve())
+    try:
+        done, _ = await asyncio.wait({service_task, server_task}, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    finally:
+        for task in (service_task, server_task):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    await inference_controller.dispose()
+    await trainer.dispose()
 
 
 if __name__ == "__main__":
