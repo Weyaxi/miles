@@ -395,6 +395,8 @@ class TinkerService:
         checkpoint_dir = resolve_checkpoint_dir(self.config.checkpoint_root, record.model_id, "weights", name)
         if not payload["overwrite"] and os.path.exists(checkpoint_dir):
             raise UserInputError(f"checkpoint {name!r} already exists; pass overwrite=True to replace it")
+        if os.path.isdir(checkpoint_dir) and not os.path.islink(checkpoint_dir):
+            raise UserInputError(f"cannot overwrite legacy checkpoint {name!r}; save under a new name")
         failure = await self.backend.save_slot(
             record.slot, checkpoint_dir, metadata=build_checkpoint_metadata(record, self.config)
         )
@@ -404,7 +406,9 @@ class TinkerService:
 
     async def _load_state(self, record: ModelRecord, payload: dict) -> dict:
         source_id, kind, name = parse_tinker_path(payload["path"])
-        checkpoint_dir = resolve_checkpoint_dir(self.config.checkpoint_root, source_id, kind, name)
+        if kind != "weights":
+            raise UserInputError("cannot load sampler weights into a training model; use a save_state checkpoint")
+        checkpoint_dir = os.path.realpath(resolve_checkpoint_dir(self.config.checkpoint_root, source_id, kind, name))
         meta = read_checkpoint_metadata(checkpoint_dir, record.tenant, payload["path"])
         validate_checkpoint_compatibility(meta, record, self.config, payload["path"])
         failure = await self.backend.load_slot(

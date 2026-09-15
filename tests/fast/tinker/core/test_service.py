@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import suppress
+from pathlib import Path
 
 import pytest
 from tests.fast.tinker.harness import (
@@ -16,7 +17,7 @@ from tests.fast.tinker.harness import (
 
 from miles.tinker.core.future import DONE, FAILED
 from miles.tinker.core.types import OwnershipError, UserInputError
-from miles.tinker.core.utils import resolve_checkpoint_dir
+from miles.tinker.core.utils import resolve_checkpoint_dir, resolve_sampler_checkpoint
 
 
 def _optim_payload(model_id: str, seq_id: int) -> dict:
@@ -129,7 +130,8 @@ async def test_save_then_load_roundtrip_paths(service):
     assert (await await_settled(service, "tenant", load)).state == DONE
     weights_only = service.backend.named("load_slot")[-1]
     assert weights_only["load_optimizer"] is False
-    assert weights_only["ckpt_path"].endswith(f"{model_id}/weights/ckpt")
+    checkpoint = Path(service.config.checkpoint_root) / model_id / "weights" / "ckpt"
+    assert weights_only["ckpt_path"] == str(checkpoint.resolve())
 
 
 async def test_sampler_save_publishes_successive_versions(service):
@@ -210,7 +212,15 @@ async def test_sample_failure_preserves_the_snapshot_and_training_stream(service
     future = await await_settled(service, "tenant", sample_id)
     assert future.state == FAILED
     assert future.error == "engine down"
-    assert service._resolve_sampler("tenant", f"tinker://{model_id}/sampler_weights/1")[0] == f"{model_id}@1"
+    assert (
+        resolve_sampler_checkpoint(
+            service.config.checkpoint_root,
+            "tenant",
+            f"tinker://{model_id}/sampler_weights/1",
+            service.config.base_model,
+        )[0]
+        == f"{model_id}@1"
+    )
     fb = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [datum()]))
     assert (await await_settled(service, "tenant", fb)).state == DONE
 
@@ -464,13 +474,15 @@ async def test_sampler_paths_resolve_independently_of_the_lease(service, expire_
         await service._sweep_once()
         assert model_id not in service.models
         service.create_session("tenant")
-    lora_name, lora_path = service._resolve_sampler("tenant", path)
+    lora_name, lora_path = resolve_sampler_checkpoint(
+        service.config.checkpoint_root, "tenant", path, service.config.base_model
+    )
     assert lora_name == f"{model_id}@1" and lora_path.endswith("/sampler_weights/1")
     with pytest.raises((UserInputError, OwnershipError)):
-        service._resolve_sampler("thief", path)
+        resolve_sampler_checkpoint(service.config.checkpoint_root, "thief", path, service.config.base_model)
     service.config.base_model = "other"
     with pytest.raises(UserInputError, match="base_model"):
-        service._resolve_sampler("tenant", path)
+        resolve_sampler_checkpoint(service.config.checkpoint_root, "tenant", path, service.config.base_model)
 
 
 async def test_an_unnamed_sampler_save_returns_a_sampling_session(service):

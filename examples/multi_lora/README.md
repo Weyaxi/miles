@@ -2,7 +2,7 @@
 
 > **Read the docs:** [Multi-LoRA training](https://miles.radixark.com/docs/advanced/lora#multi-lora-training).
 
-- `run_gateway.py`: prepare Qwen3-30B-A3B and launch the gateway.
+- `serve_qwen3_30b_a3b_tinker.py`: prepare Qwen3-30B-A3B and launch the gateway.
 - `run_multi_tenant_example.py`: check marker memorization for one client or adapter isolation across concurrent tenants.
 
 ## Layout
@@ -73,6 +73,11 @@ single-LoRA training continue to use the existing weight updater.
 
 `--tinker-checkpoint-root` must be on storage shared by the trainers, gateway,
 and every inference engine. A sampler save exports the current adapter weights,
-then commits its tensors, adapter config, and `META.json` together by renaming
-the completed directory. Existing versions cannot be overwritten. Saving between
+then publishes its tensors, adapter config, and `META.json` together through an
+atomic symlink replacement. Existing sampler versions cannot be overwritten. Saving between
 `forward_backward` and `optim_step` neither applies nor discards pending gradients.
+
+Training checkpoint names also point to immutable version directories. Overwriting
+atomically switches the link; older versions remain on disk for active readers.
+Legacy directory checkpoints can still be loaded; save under a new name instead
+of overwriting them.
