@@ -167,7 +167,7 @@ class TITOTokenizer:
         if request_kwargs is not None and not isinstance(request_kwargs, dict):
             raise ValueError("chat_template_kwargs must be an object")
         base = self.for_turn(turn_args)
-        renderer = base.clone_with_chat_template_kwargs(request_kwargs or {})
+        renderer = base.clone_with_chat_template_kwargs(request_kwargs) if request_kwargs else base
         if turn_args and renderer.chat_template_kwargs != base.chat_template_kwargs:
             raise ValueError(
                 f"chat_template_kwargs {renderer.chat_template_kwargs!r} is not accepted: the turn being "

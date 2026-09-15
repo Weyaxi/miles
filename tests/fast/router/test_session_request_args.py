@@ -148,13 +148,14 @@ class TestTurnArgs:
             third = self._turn(env, session_id, history, chat_template_kwargs=LAUNCH_KWARGS)
             assert third.status_code == 400
             assert "was rendered with" in third.json()["error"]
-            # A rejected request leaves the session untouched: no rollback, no view change.
-            assert len(_records(env.url, session_id)) == 2
+            # v1 rolls back before deciding the request, so the retry already dropped one
+            # record; v2 attaching is pure, so nothing served changes on a 400.
+            assert len(_records(env.url, session_id)) == (1 if version == "v1" else 2)
 
             fourth = self._turn(env, session_id, history, chat_template_kwargs=THINKING_ON)
             assert fourth.status_code == 200
-            # Retrying the same history: v1 rolls back one assistant step and re-appends
-            # (2 linear records); v2 commits the retry as another child (3 nodes).
+            # v1 re-appends on the rolled-back checkpoint (2 linear records); v2 commits
+            # the retry as another child of the first node (3 nodes).
             if version == "v1":
                 assert len(_records(env.url, session_id)) == 2
             else:

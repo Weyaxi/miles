@@ -15,15 +15,14 @@ from miles.rollout.session.core import (
     proxy_result_to_response,
 )
 from miles.rollout.session.errors import SessionNotFoundError, TokenizationError
-from miles.rollout.session.request_args import parse_chat_request, prepare_chat_request
+from miles.rollout.session.request_args import parse_chat_request
 from miles.rollout.session.samples.codec import COMPUTED_FIELDS_V2, encode_samples
 from miles.rollout.session.types import GetSessionResponse, SessionRecord
 from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY, build_session_rollout_metrics
 from miles.rollout.session.v2.session_state import (
     SessionRegistryV2,
-    attach_point_for_request,
     commit_generation,
-    prepare_pretokenized,
+    prepare_token_ids_and_request_args,
 )
 from miles.rollout.session.v2.utils import build_leaf_material, tree_metadata
 from miles.utils.function_registry import load_function
@@ -157,27 +156,16 @@ class SessionCoreV2(SessionCore):
                 raise SessionNotFoundError(f"session not found: session_id={session_id}")
 
             client, client_stream = parse_chat_request(body)
-            request_messages = client.get("messages", [])
-            # Attaching is a pure lookup: the renderer follows the node this request
-            # continues, and a rejected request leaves the session untouched.
-            attach_parent = attach_point_for_request(
-                session, request_messages, message_matcher=self.registry.message_matcher
-            ).node
-            prepared = prepare_chat_request(
+            prepared, attach_parent = prepare_token_ids_and_request_args(
+                session,
                 client,
-                self.registry.tito_tokenizer,
                 config=self.config,
-                turn_args=attach_parent.turn_args if attach_parent is not None else {},
+                tito_tokenizer=self.registry.tito_tokenizer,
+                message_matcher=self.registry.message_matcher,
             )
             request_body, tito_tokenizer = prepared.body, prepared.tito_tokenizer
-
-            prompt_token_ids = prepare_pretokenized(
-                attach_parent,
-                request_messages,
-                tools=request_body.get("tools"),
-                tito_tokenizer=tito_tokenizer,
-            )
-            request_body["input_ids"] = prompt_token_ids
+            request_messages = request_body.get("messages", [])
+            prompt_token_ids = request_body["input_ids"]
             logger.debug("Using TITO input_ids: %d tokens", len(prompt_token_ids))
 
             checkpoint_token_ids = attach_parent.token_ids if attach_parent is not None else []

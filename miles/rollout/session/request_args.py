@@ -14,10 +14,19 @@ The whole decision lives in this module, in the order it runs:
    ``turn_args`` recorded by the turn this request continues (empty for a new
    root).  The renderer's effective kwargs are what goes on the wire.
 
-``prepare_chat_request`` runs steps 2 and 3 and returns the body the session
-then completes with its rendered ``input_ids``.  The core looks up
-``turn_args`` (v1 rollback target, v2 attach point) read-only before calling
-it, so a rejected request never changes session state.
+``prepare_chat_request`` runs steps 2 and 3.  The session's
+``prepare_token_ids_and_request_args`` (v1 ``LinearTrajectory`` method, v2
+``session_state`` function) calls it after rolling back / positioning on the
+request's messages and before rendering ``input_ids`` with the renderer it
+picked, because the args change the token ids.
+
+Why this order: messages are the highest-priority source of truth.  Some
+models break the KV cache when certain args change between turns, such as
+tools or reasoning effort; that is incorrect behavior.  To prevent it, the
+session stores some of these args on the checkpoint (``turn_args``, written by
+``TITOTokenizer.turn_args_for_commit``) and the tokenizer family applies a
+customizable check against them (``TITOTokenizer.for_request``) before the
+prompt is rendered.
 """
 
 import json
@@ -67,7 +76,7 @@ def prepare_chat_request(
     turn_args: dict[str, Any],
 ) -> PreparedChatRequest:
     """Decide the outbound arguments of a parsed chat request; shared verbatim
-    by the v1 and v2 cores.  Raises (HTTP 400) before any session state changes.
+    by the v1 and v2 sessions.  Raises ``MessageValidationError`` (HTTP 400).
 
     ``turn_args`` is what the turn this request continues recorded when it
     committed (``TITOTokenizer.turn_args_for_commit``), empty for a new root.
