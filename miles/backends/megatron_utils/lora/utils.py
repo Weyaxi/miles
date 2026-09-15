@@ -468,7 +468,7 @@ def load_lora_adapter(
 
     HF adapters cannot be loaded into Bridge models through this path.
     """
-    adapter_dir = Path(adapter_path)
+    adapter_dir = Path(adapter_path).resolve()
     if not adapter_dir.exists():
         logger.warning(f"LoRA adapter path does not exist: {adapter_dir}")
         return False, None
