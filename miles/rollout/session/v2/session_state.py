@@ -130,12 +130,13 @@ def _render_token_ids(
     - Otherwise: reuse the parent's token snapshot as-is and tokenize only
       the new suffix on top — the shared prefix is never re-rendered.
     """
+    template_args = tito_tokenizer.default_template_args(tools)
     if parent is None:
         return tito_tokenizer.apply_chat_template(
             request_messages,
-            tools=tools,
             add_generation_prompt=True,
             tokenize=True,
+            template_args=template_args,
         )
 
     stored = parent.path_messages()
@@ -145,7 +146,7 @@ def _render_token_ids(
         old_messages=stored,
         new_messages=effective_messages,
         pretokenized_token_ids=parent.token_ids,
-        tools=tools,
+        template_args=template_args,
     )
 
 
@@ -235,11 +236,12 @@ class SessionRegistryV2(SessionRegistry):
         if not token_ids:
             return None
         try:
-            expected_ids = self.tito_tokenizer.for_turn(turn_args).apply_chat_template(
+            renderer = self.tito_tokenizer.for_turn(turn_args)
+            expected_ids = renderer.apply_chat_template(
                 messages,
-                tools=tools,
                 add_generation_prompt=False,
                 tokenize=True,
+                template_args=renderer.default_template_args(tools),
             )
             mismatches = self.comparator.compare_sequences(expected_ids, token_ids)
             return [m.to_dict() for m in mismatches]

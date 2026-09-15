@@ -156,13 +156,14 @@ class LinearTrajectory:
         Must be called under ``self.lock``.
         """
         matcher = message_matcher if message_matcher is not None else strict_message_matches
+        template_args = tito_tokenizer.default_template_args(tools)
 
         if not self.token_ids:
             return tito_tokenizer.apply_chat_template(
                 request_messages,
-                tools=tools,
                 add_generation_prompt=True,
                 tokenize=True,
+                template_args=template_args,
             )
 
         # Confirm the (rolled-back) stored messages are a prefix of request,
@@ -181,7 +182,7 @@ class LinearTrajectory:
             old_messages=self.messages,
             new_messages=effective_messages,
             pretokenized_token_ids=self.token_ids,
-            tools=tools,
+            template_args=template_args,
         )
 
     def update_pretokenized_state(
@@ -382,11 +383,12 @@ class SessionRegistry:
             return None
         try:
             tools = session.records[-1].request.get("tools") if session.records else None
-            expected_ids = self.tito_tokenizer.for_turn(session.turn_args).apply_chat_template(
+            renderer = self.tito_tokenizer.for_turn(session.turn_args)
+            expected_ids = renderer.apply_chat_template(
                 session.messages,
-                tools=tools,
                 add_generation_prompt=False,
                 tokenize=True,
+                template_args=renderer.default_template_args(tools),
             )
             mismatches = self.comparator.compare_sequences(expected_ids, session.token_ids)
             return [m.to_dict() for m in mismatches]
