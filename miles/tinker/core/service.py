@@ -131,9 +131,9 @@ class TinkerService:
         lora_config = payload.get("lora_config") or {}
         self._reject_unsupported_lora_config(lora_config)
         rank = lora_config.get("rank", 32)
-        if rank > self.config.max_lora_rank:
+        if type(rank) is not int or not 1 <= rank <= self.config.max_lora_rank:
             raise UserInputError(
-                f"lora_config.rank={rank} exceeds this gateway's slot capacity (--lora-rank {self.config.max_lora_rank})"
+                f"lora_config.rank must be an integer in [1, {self.config.max_lora_rank}], got {rank!r}"
             )
         alpha = self.config.lora_alpha if self.config.lora_alpha is not None else float(2 * rank)
         if not self.free_slots:
