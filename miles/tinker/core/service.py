@@ -4,6 +4,7 @@ The trainer lock serializes trainer calls across dispatch, model creation, and l
 
 import asyncio
 import logging
+import math
 import os
 import time
 import uuid
@@ -276,6 +277,20 @@ class TinkerService:
         required_inputs = LOSS_FN_INPUTS.get(payload["loss_fn"])
         if required_inputs is None:
             raise UserInputError(f"unknown loss_fn {payload['loss_fn']!r}; known: {sorted(LOSS_FN_INPUTS)}")
+        loss_fn_config = payload.get("loss_fn_config")
+        if loss_fn_config is not None:
+            if not isinstance(loss_fn_config, dict):
+                raise UserInputError("loss_fn_config must be an object")
+            config_keys = {
+                "ppo": ("clip_low_threshold", "clip_high_threshold"),
+                "cispo": ("clip_low_threshold", "clip_high_threshold"),
+                "dro": ("beta",),
+            }.get(payload["loss_fn"], ())
+            for key in config_keys:
+                if key in loss_fn_config:
+                    value = loss_fn_config[key]
+                    if type(value) not in (int, float) or not math.isfinite(value):
+                        raise UserInputError(f"loss_fn_config[{key!r}] must be a finite number")
         total_tokens = 0
         for index, datum in enumerate(datums):
             if len(datum["tokens"]) > self.config.max_tokens_per_datum:

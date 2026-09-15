@@ -3,6 +3,8 @@
 Datums encode input x and explicit target labels t as x + [t[-1]],
 so each output scores logprob(t[i] | x[0..i])."""
 
+import math
+
 import pydantic
 
 from miles.tinker.core.types import LOSS_INPUT_KEYS, UserInputError
@@ -179,9 +181,17 @@ def render_result(result: dict) -> dict:
         }
     if op == "sample":
         rendered = {"type": "sample", "sequences": result["sequences"]}
-        for key in ("prompt_logprobs", "topk_prompt_logprobs"):
-            if result.get(key) is not None:
-                rendered[key] = result[key]
+        if result.get("prompt_logprobs") is not None:
+            rendered["prompt_logprobs"] = [
+                None if math.isnan(logprob) else logprob for logprob in result["prompt_logprobs"]
+            ]
+        if result.get("topk_prompt_logprobs") is not None:
+            topk = result["topk_prompt_logprobs"]
+            rendered["topk_prompt_logprobs"] = [
+                [(token_id, logprob) for token_id, logprob in zip(ids, probs, strict=True) if not math.isnan(logprob)]
+                or None
+                for ids, probs in zip(topk["token_ids"], topk["logprobs"], strict=True)
+            ]
         return rendered
     if op == "create_model":
         return {"type": "create_model", "model_id": result["model_id"]}
