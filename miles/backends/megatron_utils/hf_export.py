@@ -24,6 +24,7 @@ from miles.backends.megatron_utils.update_weight.hf_weight_iterator_direct impor
 from miles.backends.training_utils.checkpoint_io import write_checkpoint_dir
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
+from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.hf_config import HF_EXPORT_COMPLETE_MARKER, load_hf_config
 from miles.utils.megatron_bridge_utils import patch_megatron_model
 
@@ -150,12 +151,16 @@ def save_hf_model(
                 # For LoRA models, merge_adapter_weights=True (default) merges
                 # adapter weights into base weights for a standalone HF model.
                 bridge.save_hf_pretrained(model, path=tmp_dir)
+            torch.distributed.barrier(group=get_gloo_group())
+            empty = [False]
             if torch.distributed.get_rank() == 0:
-                if not any(tmp_dir.glob("*.safetensors")) and not any(tmp_dir.glob("*.bin")):
-                    raise RuntimeError(
-                        f"HF export to {path} produced no weight files — the megatron "
-                        f"bridge likely has no mapping for this model architecture."
-                    )
+                empty[0] = not any(tmp_dir.glob("*.safetensors")) and not any(tmp_dir.glob("*.bin"))
+            torch.distributed.broadcast_object_list(empty, src=0, group=get_gloo_group())
+            if empty[0]:
+                raise RuntimeError(
+                    f"HF export to {path} produced no weight files — the megatron "
+                    f"bridge likely has no mapping for this model architecture."
+                )
         if is_lora_model(model):
             write_lora_weights(model, args, tmp_dir / "adapter")
         if torch.distributed.get_rank() == 0:
