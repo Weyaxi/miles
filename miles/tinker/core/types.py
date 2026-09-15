@@ -78,6 +78,7 @@ class Command:
 @dataclass
 class ModelRecord:
     model_id: str
+    session_id: str
     tenant: str
     slot: int
     base_model: str

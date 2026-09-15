@@ -46,7 +46,7 @@ class TinkerService:
         self.free_slots = set(range(config.n_slots))
         self._wake = asyncio.Event()
         self._trainer_lock = asyncio.Lock()
-        self._sample_tasks: dict[str, tuple] = {}  # request_id -> (task, tenant)
+        self._sample_tasks: dict[str, tuple] = {}  # request_id -> (task, session_id)
         self._create_tasks: set = set()
         self._arrival_counter = 0
         self._batch_counter = 0
@@ -145,6 +145,7 @@ class TinkerService:
         future = self.futures.create(model_id, tenant)
         record = ModelRecord(
             model_id=model_id,
+            session_id=payload["session_id"],
             tenant=tenant,
             slot=slot,
             base_model=base_model,
@@ -447,7 +448,9 @@ class TinkerService:
         }
         if payload.get("sampler_path") is None:
             # unnamed saves return a sampling session bound to the new version
-            result["sampling_session_id"] = self._new_sampling_session(record.tenant, result["path"])
+            result["sampling_session_id"] = self._new_sampling_session(
+                record.tenant, record.session_id, result["path"]
+            )
         return result
 
     def weights_info(self, tenant: str, tinker_path: str) -> dict:
@@ -473,15 +476,16 @@ class TinkerService:
         seq_id = _validate_seq_id(payload["sampling_session_seq_id"], "sampling_session_seq_id", minimum=0)
         if (previous := session["sampling_sessions_by_seq"].get(seq_id)) is not None:
             return previous
-        sampling_session_id = self._new_sampling_session(tenant, payload.get("model_path"))
+        sampling_session_id = self._new_sampling_session(tenant, payload["session_id"], payload.get("model_path"))
         session["sampling_sessions_by_seq"][seq_id] = sampling_session_id
         return sampling_session_id
 
-    def _new_sampling_session(self, tenant: str, model_path: str | None) -> str:
+    def _new_sampling_session(self, tenant: str, session_id: str, model_path: str | None) -> str:
         sampling_session_id = f"sampling-{uuid.uuid4().hex}"
         self.sampling_sessions[sampling_session_id] = {
             "tenant": tenant,
             "model_path": model_path,
+            "session_id": session_id,
             "samples_by_seq": {},
         }
         return sampling_session_id
@@ -521,7 +525,8 @@ class TinkerService:
         future = self.futures.create(model_path or "base", tenant)
         sequence_ids = [f"seq-{uuid.uuid4().hex}" for _ in range(payload.get("num_samples", 1))]
         task = asyncio.create_task(self._run_sample(future.request_id, payload, lora_name, lora_path))
-        self._sample_tasks[future.request_id] = (task, tenant)
+        session_id = sampling_session["session_id"] if sampling_session is not None else None
+        self._sample_tasks[future.request_id] = (task, session_id)
         task.add_done_callback(lambda _t, rid=future.request_id: self._sample_tasks.pop(rid, None))
         task.add_done_callback(self._observe_background_task)
         if sampling_session is not None:
@@ -553,42 +558,35 @@ class TinkerService:
             entry[0].cancel()
 
     async def sweep_leases(self) -> None:
-        """Reclaim from stale tenants: cancel sampling, unload models, free
+        """Reclaim from stale sessions: cancel sampling, unload models, free
         slots. Training state dies with the lease; only checkpoints survive."""
         while True:
             await asyncio.sleep(30)
             await self._sweep_once()
 
     async def _sweep_once(self) -> None:
-        now = time.monotonic()
-        had_sessions = bool(self.sessions)
-        fresh_tenants = {
-            session["tenant"]
-            for session in self.sessions.values()
-            if now - session["last_heartbeat"] < self.config.lease_timeout_s
-        }
-
-        def lease_expired(tenant: str) -> bool:
-            # with no sessions at all there is no lease to expire
-            return had_sessions and tenant not in fresh_tenants
-
-        for session_id, session in list(self.sessions.items()):
-            if lease_expired(session["tenant"]):
+        async with self._trainer_lock:
+            now = time.monotonic()
+            expired_sessions = {
+                session_id
+                for session_id, session in self.sessions.items()
+                if now - session["last_heartbeat"] >= self.config.lease_timeout_s
+            }
+            for session_id in expired_sessions:
                 del self.sessions[session_id]
-        for sampling_session_id, record in list(self.sampling_sessions.items()):
-            if lease_expired(record["tenant"]):
-                del self.sampling_sessions[sampling_session_id]
+            for sampling_session_id, record in list(self.sampling_sessions.items()):
+                if record["session_id"] in expired_sessions:
+                    del self.sampling_sessions[sampling_session_id]
 
-        for request_id, (task, tenant) in list(self._sample_tasks.items()):
-            if lease_expired(tenant):
-                logger.warning(f"lease expired for tenant of sample {request_id}; cancelling")
-                task.cancel()
-        for model_id, record in list(self.models.items()):
-            if not lease_expired(record.tenant):
-                continue
-            logger.warning(f"lease expired for {model_id}; freeing slot {record.slot}")
-            async with self._trainer_lock:
-                await self._close_model(model_id, "lease expired", "user")
+            for request_id, (task, session_id) in list(self._sample_tasks.items()):
+                if session_id in expired_sessions:
+                    logger.warning(f"lease expired for session of sample {request_id}; cancelling")
+                    self.futures.fail(request_id, "lease expired", "user")
+                    task.cancel()
+            for model_id, record in list(self.models.items()):
+                if record.session_id in expired_sessions:
+                    logger.warning(f"lease expired for {model_id}; freeing slot {record.slot}")
+                    await self._close_model(model_id, "lease expired", "user")
 
 
 def _validate_seq_id(value, name: str, minimum: int = 1) -> int:
