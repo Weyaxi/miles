@@ -7,6 +7,7 @@ import math
 
 import pydantic
 
+from miles.tinker.core.input_validation import validate_save_options
 from miles.tinker.core.types import LOSS_INPUT_KEYS, UserInputError
 from tinker import types as tinker_types
 from tinker.types.sample_response import MASK_LOGPROB
@@ -74,7 +75,7 @@ def _decode_command(op: str, payload: dict, decoded: dict) -> tuple[str, dict]:
     if op == "optim_step":
         return op, decoded | {"adam_params": {**ADAM_PARAM_DEFAULTS, **payload["adam_params"]}}
     if op == "save_state":
-        _reject_unsupported_save_options(payload)
+        validate_save_options(payload)
         return op, decoded | {"name": payload.get("path"), "overwrite": bool(payload.get("overwrite", False))}
     if op == "load_state":
         return op, decoded | {
@@ -83,16 +84,9 @@ def _decode_command(op: str, payload: dict, decoded: dict) -> tuple[str, dict]:
             "weights_access_token": payload.get("weights_access_token"),
         }
     if op == "save_weights_for_sampler":
-        _reject_unsupported_save_options(payload)
+        validate_save_options(payload)
         return op, decoded | {"sampler_path": payload.get("path")}
     raise UserInputError(f"unknown command op {op!r}")
-
-
-def _reject_unsupported_save_options(payload: dict) -> None:
-    if payload.get("ttl_seconds") is not None:
-        raise UserInputError("ttl_seconds is not supported: checkpoints on this gateway do not expire")
-    if payload.get("user_metadata") is not None:
-        raise UserInputError("user_metadata is not supported by this gateway")
 
 
 def model_input_tokens(model_input: dict) -> list[int]:
@@ -114,7 +108,7 @@ def build_datum(input_tokens: list[int], inputs: dict[str, list], index: int) ->
             raise UserInputError(
                 f"datum {index}: loss_fn_inputs[{name!r}] must be 1-D; multi-target inputs are not supported"
             )
-    targets = [int(t) for t in inputs["target_tokens"]]
+    targets = list(inputs["target_tokens"])
     if len(targets) != len(input_tokens):
         raise UserInputError(
             f"datum {index}: target_tokens length {len(targets)} != model_input length {len(input_tokens)}"

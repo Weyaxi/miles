@@ -102,7 +102,7 @@ class FakeBackend:
 
 
 def make_config(checkpoint_root, **overrides) -> GatewayConfig:
-    defaults = dict(base_model="base", n_slots=2, checkpoint_root=str(checkpoint_root))
+    defaults = dict(base_model="base", n_slots=2, checkpoint_root=str(checkpoint_root), vocab_size=128000)
     return GatewayConfig(**{**defaults, **overrides})
 
 

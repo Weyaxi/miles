@@ -4,32 +4,28 @@ The trainer lock serializes trainer calls across dispatch, model creation, and l
 
 import asyncio
 import logging
-import math
 import os
 import time
 import uuid
 
 from miles.tinker.core.future import Future, FutureStore
+from miles.tinker.core.input_validation import (
+    validate_batch_payload,
+    validate_checkpoint_compatibility,
+    validate_checkpoint_segment,
+    validate_model_config,
+    validate_sample_payload,
+    validate_seq_id,
+)
 from miles.tinker.core.planner import BarrierUnit, BatchUnit, Planner
 from miles.tinker.core.stream import ModelStream
-from miles.tinker.core.types import (
-    LOSS_FN_INPUTS,
-    LOSS_INPUT_KEYS,
-    Command,
-    CommandOp,
-    GatewayConfig,
-    ModelRecord,
-    OwnershipError,
-    UserInputError,
-)
+from miles.tinker.core.types import Command, CommandOp, GatewayConfig, ModelRecord, OwnershipError, UserInputError
 from miles.tinker.core.utils import (
     build_checkpoint_metadata,
     parse_tinker_path,
     read_checkpoint_metadata,
     resolve_checkpoint_dir,
     resolve_sampler_checkpoint,
-    validate_checkpoint_compatibility,
-    validate_checkpoint_segment,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,7 +118,7 @@ class TinkerService:
     def create_model(self, tenant: str, payload: dict) -> tuple[str, str]:
         """Two-phase like every command: allocate now, initialize the slot behind the future."""
         session = self._session_for(tenant, payload["session_id"])
-        model_seq_id = _validate_seq_id(payload["model_seq_id"], "model_seq_id", minimum=0)
+        model_seq_id = validate_seq_id(payload["model_seq_id"], "model_seq_id", minimum=0)
         if (previous := session["models_by_seq"].get(model_seq_id)) is not None:
             request_id, model_id = previous
             request_id = self.futures.request_id_for_retry(request_id, model_id, tenant)
@@ -132,12 +128,8 @@ class TinkerService:
         if base_model != self.config.base_model:
             raise UserInputError(f"this gateway serves {self.config.base_model!r}, not {base_model!r}")
         lora_config = payload.get("lora_config") or {}
-        self._reject_unsupported_lora_config(lora_config)
+        validate_model_config(lora_config, self.config)
         rank = lora_config.get("rank", 32)
-        if type(rank) is not int or not 1 <= rank <= self.config.max_lora_rank:
-            raise UserInputError(
-                f"lora_config.rank must be an integer in [1, {self.config.max_lora_rank}], got {rank!r}"
-            )
         alpha = self.config.lora_alpha if self.config.lora_alpha is not None else float(2 * rank)
         if not self.free_slots:
             raise UserInputError(f"no free adapter slots (capacity {self.config.n_slots})")
@@ -175,23 +167,6 @@ class TinkerService:
                 await self._close_model(record.model_id, failure["error"], "server")
                 return
             self.futures.resolve(record.create_request_id, {"op": "create_model", "model_id": record.model_id})
-
-    def _reject_unsupported_lora_config(self, lora_config: dict) -> None:
-        """Reject per-model settings that conflict with the fixed server adapter layout."""
-        if lora_config.get("seed") is not None:
-            raise UserInputError("lora_config.seed is not supported: adapter initialization is not per-model seedable")
-        layout = {
-            "train_attn": self.config.trains_attn,
-            "train_mlp": self.config.trains_mlp,
-            "train_unembed": self.config.trains_unembed,
-        }
-        for field, layout_trains in layout.items():
-            requested = lora_config.get(field)
-            if requested is not None and requested != layout_trains:
-                raise UserInputError(
-                    f"lora_config.{field}={requested} conflicts with this gateway's adapter layout "
-                    f"({field}={layout_trains}); the layout is fixed by --target-modules at server start"
-                )
 
     def get_model(self, tenant: str, model_id: str) -> ModelRecord:
         record = self.models.get(model_id)
@@ -234,7 +209,7 @@ class TinkerService:
             raise UserInputError(f"unknown command op {op!r}") from None
         model_id = payload["model_id"]
         self.get_model(tenant, model_id)
-        seq_id = _validate_seq_id(payload["seq_id"], "seq_id")
+        seq_id = validate_seq_id(payload["seq_id"], "seq_id")
         stream = self.planner.stream(model_id)
 
         # retries must not accumulate gradients twice
@@ -249,7 +224,7 @@ class TinkerService:
         validation_error = payload.get("validation_error")
         if validation_error is None:
             try:
-                self._validate_batch_payload(op, payload)
+                validate_batch_payload(op, payload, self.config)
             except UserInputError as error:
                 validation_error = str(error)
         stream.submit(
@@ -265,65 +240,6 @@ class TinkerService:
         )
         self._wake.set()
         return future.request_id
-
-    def _validate_batch_payload(self, op: CommandOp, payload: dict) -> None:
-        if not op.is_batch():
-            return
-        datums = payload["datums"]
-        if not datums:
-            raise UserInputError("forward_backward with no data")
-        if len(datums) > self.config.max_datums_per_request:
-            raise UserInputError(
-                f"{len(datums)} datums exceeds max_datums_per_request={self.config.max_datums_per_request}"
-            )
-        required_inputs = LOSS_FN_INPUTS.get(payload["loss_fn"])
-        if required_inputs is None:
-            raise UserInputError(f"unknown loss_fn {payload['loss_fn']!r}; known: {sorted(LOSS_FN_INPUTS)}")
-        loss_fn_config = payload.get("loss_fn_config")
-        if loss_fn_config is not None:
-            if not isinstance(loss_fn_config, dict):
-                raise UserInputError("loss_fn_config must be an object")
-            config_keys = {
-                "ppo": ("clip_low_threshold", "clip_high_threshold"),
-                "cispo": ("clip_low_threshold", "clip_high_threshold"),
-                "dro": ("beta",),
-            }.get(payload["loss_fn"], ())
-            for key in config_keys:
-                if key in loss_fn_config:
-                    value = loss_fn_config[key]
-                    if type(value) not in (int, float) or not math.isfinite(value):
-                        raise UserInputError(f"loss_fn_config[{key!r}] must be a finite number")
-        total_tokens = 0
-        for index, datum in enumerate(datums):
-            if len(datum["tokens"]) > self.config.max_tokens_per_datum:
-                raise UserInputError(
-                    f"datum {index}: {len(datum['tokens'])} tokens exceeds {self.config.max_tokens_per_datum}"
-                )
-            total_tokens += len(datum["tokens"])
-            for wire_key in required_inputs:
-                values = datum.get(LOSS_INPUT_KEYS[wire_key])
-                if values is None:
-                    raise UserInputError(
-                        f"datum {index}: loss_fn {payload['loss_fn']!r} needs loss_fn_inputs[{wire_key!r}]"
-                    )
-                if len(values) != datum["target_len"]:
-                    raise UserInputError(
-                        f"datum {index}: loss_fn_inputs[{wire_key!r}] has {len(values)} values "
-                        f"for {datum['target_len']} target tokens"
-                    )
-            unread = [
-                wire_key
-                for wire_key, datum_key in LOSS_INPUT_KEYS.items()
-                if wire_key not in required_inputs and datum_key in datum
-            ]
-            if unread:
-                raise UserInputError(
-                    f"datum {index}: loss_fn {payload['loss_fn']!r} does not read loss_fn_inputs {unread}"
-                )
-        if total_tokens > self.config.max_tokens_per_request:
-            raise UserInputError(
-                f"{total_tokens} tokens exceeds max_tokens_per_request={self.config.max_tokens_per_request}"
-            )
 
     def retrieve_future(self, tenant: str, request_id: str) -> Future | None:
         return self.futures.get(request_id, tenant)
@@ -493,7 +409,7 @@ class TinkerService:
         base_model = payload.get("base_model")
         if base_model is not None and base_model != self.config.base_model:
             raise UserInputError(f"this gateway serves {self.config.base_model!r}, not {base_model!r}")
-        seq_id = _validate_seq_id(payload["sampling_session_seq_id"], "sampling_session_seq_id", minimum=0)
+        seq_id = validate_seq_id(payload["sampling_session_seq_id"], "sampling_session_seq_id", minimum=0)
         if (previous := session["sampling_sessions_by_seq"].get(seq_id)) is not None:
             return previous
         sampling_session_id = self._new_sampling_session(tenant, payload["session_id"], payload.get("model_path"))
@@ -540,18 +456,13 @@ class TinkerService:
             if sampling_session["tenant"] != tenant:
                 raise OwnershipError("sampling session does not belong to this tenant")
             model_path = model_path or sampling_session["model_path"]
-            seq_id = _validate_seq_id(payload["seq_id"], "seq_id", minimum=0)
+            seq_id = validate_seq_id(payload["seq_id"], "seq_id", minimum=0)
             if (previous := sampling_session["samples_by_seq"].get(seq_id)) is not None:
                 request_id, sequence_ids = previous
                 request_id = self.futures.request_id_for_retry(request_id, model_path or "base", tenant)
                 sampling_session["samples_by_seq"][seq_id] = (request_id, sequence_ids)
                 return request_id, sequence_ids
-        num_samples = payload.get("num_samples", 1)
-        if type(num_samples) is not int or not 1 <= num_samples <= self.config.max_samples_per_request:
-            raise UserInputError(f"num_samples must be an integer in [1, {self.config.max_samples_per_request}]")
-        topk = payload.get("topk_prompt_logprobs", 0)
-        if type(topk) is not int or topk < 0:
-            raise UserInputError("topk_prompt_logprobs must be a nonnegative integer")
+        validate_sample_payload(payload, self.config)
         lora_name, lora_path = (
             resolve_sampler_checkpoint(self.config.checkpoint_root, tenant, model_path, self.config.base_model)
             if model_path
@@ -622,10 +533,3 @@ class TinkerService:
                 if record.session_id in expired_sessions:
                     logger.warning(f"lease expired for {model_id}; freeing slot {record.slot}")
                     await self._close_model(model_id, "lease expired", "user")
-
-
-def _validate_seq_id(value, name: str, minimum: int = 1) -> int:
-    # stream seq_ids are 1-based (the watermark starts at 0); idempotency keys are 0-based
-    if not isinstance(value, int) or value < minimum:
-        raise UserInputError(f"{name} must be an integer >= {minimum}, got {value!r}")
-    return value
