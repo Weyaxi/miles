@@ -50,6 +50,7 @@ def _decode_forward_backward(message) -> dict:
         datums.append(build_datum(tokens, inputs, index))
 
     loss_fn_config = dict(message.loss_fn_config)
+    # Tinker SDK's v2 protobuf config supports both numeric and string values.
     if message.loss_fn_config_v2:
         loss_fn_config = {}
         for name, value in message.loss_fn_config_v2.items():
