@@ -112,10 +112,12 @@ class TinkerService:
             raise UserInputError(f"unknown session {session_id!r}; create a session first")
         return session
 
-    def heartbeat(self, tenant: str, session_id: str) -> None:
+    def heartbeat(self, tenant: str, session_id: str) -> bool:
         session = self.sessions.get(session_id)
-        if session is not None and session["tenant"] == tenant:
-            session["last_heartbeat"] = time.monotonic()
+        if session is None or session["tenant"] != tenant:
+            return False
+        session["last_heartbeat"] = time.monotonic()
+        return True
 
     def create_model(self, tenant: str, payload: dict) -> tuple[str, str]:
         """Two-phase like every command: allocate now, initialize the slot behind the future."""
@@ -425,7 +427,10 @@ class TinkerService:
         if kind != "weights":
             raise UserInputError("cannot load sampler weights into a training model; use a save_state checkpoint")
         checkpoint_dir = os.path.realpath(resolve_checkpoint_dir(self.config.checkpoint_root, source_id, kind, name))
-        meta = read_checkpoint_metadata(checkpoint_dir, record.tenant, payload["path"])
+        source_tenant = payload.get("weights_access_token")
+        if source_tenant is None:
+            source_tenant = record.tenant
+        meta = read_checkpoint_metadata(checkpoint_dir, source_tenant, payload["path"])
         validate_checkpoint_compatibility(meta, record, self.config, payload["path"])
         failure = await self.backend.load_slot(
             record.slot,
@@ -496,6 +501,8 @@ class TinkerService:
         return sampling_session_id
 
     def _new_sampling_session(self, tenant: str, session_id: str, model_path: str | None) -> str:
+        if model_path is not None:
+            resolve_sampler_checkpoint(self.config.checkpoint_root, tenant, model_path, self.config.base_model)
         sampling_session_id = f"sampling-{uuid.uuid4().hex}"
         self.sampling_sessions[sampling_session_id] = {
             "tenant": tenant,
@@ -504,6 +511,18 @@ class TinkerService:
             "samples_by_seq": {},
         }
         return sampling_session_id
+
+    def get_sampler(self, tenant: str, sampling_session_id: str) -> dict:
+        session = self.sampling_sessions.get(sampling_session_id)
+        if session is None:
+            raise UserInputError(f"unknown sampling session {sampling_session_id!r}")
+        if session["tenant"] != tenant:
+            raise OwnershipError("sampling session does not belong to this tenant")
+        return {
+            "sampler_id": sampling_session_id,
+            "base_model": self.config.base_model,
+            "model_path": session["model_path"],
+        }
 
     def submit_sample(self, tenant: str, payload: dict) -> tuple[str, list[str]]:
         base_model = payload.get("base_model")
@@ -527,11 +546,12 @@ class TinkerService:
                 request_id = self.futures.request_id_for_retry(request_id, model_path or "base", tenant)
                 sampling_session["samples_by_seq"][seq_id] = (request_id, sequence_ids)
                 return request_id, sequence_ids
-        if payload.get("num_samples", 1) > self.config.max_samples_per_request:
-            raise UserInputError(
-                f"num_samples {payload['num_samples']} exceeds max_samples_per_request="
-                f"{self.config.max_samples_per_request}"
-            )
+        num_samples = payload.get("num_samples", 1)
+        if type(num_samples) is not int or not 1 <= num_samples <= self.config.max_samples_per_request:
+            raise UserInputError(f"num_samples must be an integer in [1, {self.config.max_samples_per_request}]")
+        topk = payload.get("topk_prompt_logprobs", 0)
+        if type(topk) is not int or topk < 0:
+            raise UserInputError("topk_prompt_logprobs must be a nonnegative integer")
         lora_name, lora_path = (
             resolve_sampler_checkpoint(self.config.checkpoint_root, tenant, model_path, self.config.base_model)
             if model_path

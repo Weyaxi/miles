@@ -9,6 +9,7 @@ import pydantic
 
 from miles.tinker.core.types import LOSS_INPUT_KEYS, UserInputError
 from tinker import types as tinker_types
+from tinker.types.sample_response import MASK_LOGPROB
 
 # materialized at the boundary so core and the executor can require every key
 ADAM_PARAM_DEFAULTS = tinker_types.AdamParams().model_dump()
@@ -76,7 +77,11 @@ def _decode_command(op: str, payload: dict, decoded: dict) -> tuple[str, dict]:
         _reject_unsupported_save_options(payload)
         return op, decoded | {"name": payload.get("path"), "overwrite": bool(payload.get("overwrite", False))}
     if op == "load_state":
-        return op, decoded | {"path": payload["path"], "optimizer": payload["optimizer"]}
+        return op, decoded | {
+            "path": payload["path"],
+            "optimizer": payload["optimizer"],
+            "weights_access_token": payload.get("weights_access_token"),
+        }
     if op == "save_weights_for_sampler":
         _reject_unsupported_save_options(payload)
         return op, decoded | {"sampler_path": payload.get("path")}
@@ -130,6 +135,8 @@ def tensor_data_to_list(tensor_data) -> list:
         return tensor_data
     if not isinstance(tensor_data, dict):
         raise UserInputError(f"expected TensorData, got {type(tensor_data).__name__}")
+    if len(tensor_data.get("shape") or []) > 1:
+        raise UserInputError("multi-target inputs are not supported; loss_fn_inputs must be 1-D")
     if tensor_data.get("sparse_crow_indices") is not None:
         return _dense_from_csr(tensor_data)
     data = tensor_data.get("data")
@@ -188,7 +195,11 @@ def render_result(result: dict) -> dict:
         if result.get("topk_prompt_logprobs") is not None:
             topk = result["topk_prompt_logprobs"]
             rendered["topk_prompt_logprobs"] = [
-                [(token_id, logprob) for token_id, logprob in zip(ids, probs, strict=True) if not math.isnan(logprob)]
+                [
+                    (token_id, logprob)
+                    for token_id, logprob in zip(ids, probs, strict=True)
+                    if (token_id, logprob) != (0, MASK_LOGPROB)
+                ]
                 or None
                 for ids, probs in zip(topk["token_ids"], topk["logprobs"], strict=True)
             ]

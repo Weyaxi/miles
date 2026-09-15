@@ -80,7 +80,9 @@ def resolve_sampler_checkpoint(checkpoint_root: str, tenant: str, model_path: st
     """Return the adapter name and directory so engines can reload evicted snapshots."""
     model_id, kind, name = parse_tinker_path(model_path)
     if kind != "sampler_weights":
-        raise UserInputError(f"cannot sample from {model_path!r}: not a sampler_weights path")
+        raise UserInputError(
+            f"sampling from training checkpoints is not supported: {model_path!r}; use save_weights_for_sampler()"
+        )
     checkpoint_dir = resolve_checkpoint_dir(checkpoint_root, model_id, "sampler_weights", name)
     meta = read_checkpoint_metadata(checkpoint_dir, tenant, model_path)
     if meta["base_model"] != base_model:

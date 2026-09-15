@@ -46,6 +46,12 @@ python examples/multi_lora/run_multi_tenant_example.py --base-model /root/models
 python examples/multi_lora/run_multi_tenant_example.py --base-model /root/models/Qwen3-30B-A3B --mode multi --clients 4
 ```
 
+## Supported inputs
+
+Training accepts text with 1-D loss inputs. 2-D soft targets, including SDFT,
+are not supported. Sampling requires a `/sampler_weights/` path returned by
+`save_weights_for_sampler()`; `/weights/` training checkpoints cannot be sampled directly.
+
 ## Failure handling
 
 A terminal failure of `forward_backward`, `optim_step`, or `load_state` ends
