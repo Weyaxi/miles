@@ -892,7 +892,7 @@ class TestComputeSessionMismatch:
             _messages(session),
             add_generation_prompt=False,
             tokenize=True,
-            template_args={},
+            template_args=None,
         )
 
     def test_returns_mismatch_dicts(self, registry: SessionRegistryV2):
@@ -926,18 +926,19 @@ class TestComputeSessionMismatch:
         with pytest.raises(TokenizationError, match="tokenizer failed"):
             registry.compute_session_mismatch(session)
 
-    def test_uses_tools_from_last_record(self, registry: SessionRegistryV2):
+    def test_renders_with_the_tools_the_latest_node_recorded(self, registry: SessionRegistryV2):
         sid = registry.create_session()
         session = registry.get_session(sid)
         _commit(session, [SYS_MSG, USER_MSG], ASSISTANT_MSG_1, [1, 2], [10], max_trim_tokens=0)
 
         tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        # A record carrying other tools does not matter: the node's template args do.
         record = SessionRecord(
             timestamp=1.0,
             method="POST",
             path="/v1/chat/completions",
             status_code=200,
-            request={"tools": tools},
+            request={"tools": [{"type": "function", "function": {"name": "get_time"}}]},
             response={},
         )
         t2 = [SYS_MSG, USER_MSG, ASSISTANT_MSG_1, TOOL_MSG_1]
@@ -952,6 +953,7 @@ class TestComputeSessionMismatch:
             record=record,
             response_id="resp-tools",
             finish_reason="stop",
+            turn_args={"tools": tools},
         )
 
         mock_tokenize = MagicMock(return_value=[1, 2, 10])
@@ -962,27 +964,19 @@ class TestComputeSessionMismatch:
 
         registry.compute_session_mismatch(session)
 
-        # Verify tools were passed to the TITO renderer.
         _, kwargs = mock_tokenize.call_args
-        assert kwargs["template_args"]["tools"] == tools
+        assert kwargs["template_args"] == {"tools": tools}
         assert kwargs["add_generation_prompt"] is False
 
     def test_renders_with_the_kwargs_the_latest_node_recorded(self, registry: SessionRegistryV2):
         sid = registry.create_session()
         session = registry.get_session(sid)
         _commit(session, [SYS_MSG, USER_MSG], ASSISTANT_MSG_1, [1, 2, 3], [10, 11], max_trim_tokens=0)
-        session.latest().turn_args = {"chat_template_kwargs": {"reasoning_effort": "low"}}
+        session.latest().turn_args = {"reasoning_effort": "low"}
 
-        seen_kwargs: list[dict] = []
-
-        def renderer_with(kwargs):
-            seen_kwargs.append(kwargs)
-            renderer = MagicMock()
-            renderer.apply_chat_template.return_value = [1, 2, 3, 10, 11]
-            return renderer
-
-        registry.tito_tokenizer.with_chat_template_kwargs = renderer_with
+        mock_tokenize = MagicMock(return_value=[1, 2, 3, 10, 11])
+        registry.tito_tokenizer.apply_chat_template = mock_tokenize
         registry.comparator = MagicMock(compare_sequences=MagicMock(return_value=[]))
 
         assert registry.compute_session_mismatch(session) == []
-        assert seen_kwargs == [{"reasoning_effort": "low"}]
+        assert mock_tokenize.call_args.kwargs["template_args"] == {"reasoning_effort": "low"}

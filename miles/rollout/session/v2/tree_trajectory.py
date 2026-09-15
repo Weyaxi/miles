@@ -26,8 +26,8 @@ class TrajectoryNode:
     response_id: str  # upstream response id: the agent-branch <-> leaf join key
     record: SessionRecord
     finish_reason: str
-    # What the tokenizer recorded at commit (``TITOTokenizer.turn_args_for_commit``);
-    # a request continuing this node renders alike.
+    # The template args this node was rendered with (``PreparedChatRequest.template_args``:
+    # chat template kwargs and tools); a request continuing this node renders alike.
     turn_args: dict[str, Any] = field(default_factory=dict)
     parent: "TrajectoryNode | None" = None
     children: list["TrajectoryNode"] = field(default_factory=list, repr=False)

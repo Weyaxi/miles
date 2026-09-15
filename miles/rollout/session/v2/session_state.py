@@ -99,9 +99,9 @@ def prepare_token_ids_and_request_args(
     plus the node it attaches under (the parent for ``commit_generation``).
 
     In order: find the attach node (``attach_point_for_request``, pure); decide
-    the request args against that node's recorded ``turn_args``
-    (``request_args.prepare_chat_request``, which may raise a 400 and picks the
-    renderer); render the prompt under that node with that renderer. The args
+    the template args and the rest of the request against that node's recorded
+    ``turn_args`` (``request_args.prepare_chat_request``, which may raise a
+    400); render the prompt under that node with those template args. The args
     come before the render because they change the token ids; see
     ``request_args`` for why they are checked against the node. Nothing here
     changes session state.
@@ -109,10 +109,10 @@ def prepare_token_ids_and_request_args(
     request_messages = client.get("messages", [])
     parent = attach_point_for_request(state, request_messages, message_matcher=message_matcher).node
     prepared = prepare_chat_request(
-        client, tito_tokenizer, config=config, turn_args=parent.turn_args if parent is not None else {}
+        client, tito_tokenizer, config=config, turn_args=parent.turn_args if parent is not None else None
     )
     prepared.body["input_ids"] = _render_token_ids(
-        parent, request_messages, tools=prepared.body.get("tools"), tito_tokenizer=prepared.tito_tokenizer
+        parent, request_messages, template_args=prepared.template_args, tito_tokenizer=tito_tokenizer
     )
     return prepared, parent
 
@@ -121,16 +121,16 @@ def _render_token_ids(
     parent: TrajectoryNode | None,
     request_messages: list[dict[str, Any]],
     *,
-    tools: list[dict[str, Any]] | None,
+    template_args: dict[str, Any],
     tito_tokenizer: TITOTokenizer,
 ) -> list[int]:
-    """Prompt input_ids for a request attaching under *parent*.
+    """Prompt input_ids for a request attaching under *parent*, rendered with
+    *template_args*.
 
     - No parent (new root): render the whole request from scratch.
     - Otherwise: reuse the parent's token snapshot as-is and tokenize only
       the new suffix on top — the shared prefix is never re-rendered.
     """
-    template_args = tito_tokenizer.default_template_args(tools)
     if parent is None:
         return tito_tokenizer.apply_chat_template(
             request_messages,
@@ -227,21 +227,20 @@ class SessionRegistryV2(SessionRegistry):
         self,
         messages: list[dict[str, Any]],
         token_ids: list[int],
-        tools: Any,
         *,
         turn_args: dict[str, Any],
     ) -> list[dict] | None:
         """Compare accumulated token IDs against canonical chat template
-        output for one path, rendered as its leaf recorded. Read-only."""
+        output for one path, rendered as its leaf recorded (an empty record
+        means the launch defaults). Read-only."""
         if not token_ids:
             return None
         try:
-            renderer = self.tito_tokenizer.for_turn(turn_args)
-            expected_ids = renderer.apply_chat_template(
+            expected_ids = self.tito_tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=False,
                 tokenize=True,
-                template_args=renderer.default_template_args(tools),
+                template_args=turn_args or None,
             )
             mismatches = self.comparator.compare_sequences(expected_ids, token_ids)
             return [m.to_dict() for m in mismatches]
@@ -253,6 +252,4 @@ class SessionRegistryV2(SessionRegistry):
         node = state.latest()
         if node is None:
             return None
-        return self.compute_mismatch(
-            node.path_messages(), node.token_ids, node.record.request.get("tools"), turn_args=node.turn_args
-        )
+        return self.compute_mismatch(node.path_messages(), node.token_ids, turn_args=node.turn_args)

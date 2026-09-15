@@ -9,24 +9,27 @@ The whole decision lives in this module, in the order it runs:
    and logs why, ``server_strict`` refuses it with HTTP 400.  A field named
    nowhere is the client's and is forwarded as sent (sampling parameters,
    ``model``, ``messages``, ``tools``, unknown keys).
-3. ``TITOTokenizer.for_request``: the renderer, and with it the effective
-   ``chat_template_kwargs``, chosen by the tokenizer family against the
-   ``turn_args`` recorded by the turn this request continues (empty for a new
-   root).  The renderer's effective kwargs are what goes on the wire.
+3. ``TITOTokenizer.template_args_for_request``: the template args, one dict
+   holding every keyword the chat template takes besides the messages,
+   ``tools`` included, chosen by the tokenizer family against the
+   ``turn_args`` recorded by the turn this request continues (``None`` for a
+   new root).  That dict is what the prompt is rendered with, what goes on
+   the wire as ``tools`` and ``chat_template_kwargs``, and what the committed
+   turn records.
 
 ``prepare_chat_request`` runs steps 2 and 3.  The session's
 ``prepare_token_ids_and_request_args`` (v1 ``LinearTrajectory`` method, v2
 ``session_state`` function) calls it after rolling back / positioning on the
-request's messages and before rendering ``input_ids`` with the renderer it
-picked, because the args change the token ids.
+request's messages and before rendering ``input_ids`` with the template args
+it returned, because the args change the token ids.
 
 Why this order: messages are the highest-priority source of truth.  Some
 models break the KV cache when certain args change between turns, such as
 tools or reasoning effort; that is incorrect behavior.  To prevent it, the
-session stores some of these args on the checkpoint (``turn_args``, written by
-``TITOTokenizer.turn_args_for_commit``) and the tokenizer family applies a
-customizable check against them (``TITOTokenizer.for_request``) before the
-prompt is rendered.
+session stores these args on the checkpoint (``turn_args``, the template args
+it was rendered with) and the tokenizer family applies a customizable check
+against them (``TITOTokenizer.template_args_for_request``) before the prompt
+is rendered.
 """
 
 import json
@@ -62,10 +65,11 @@ def parse_chat_request(body: bytes) -> tuple[dict[str, Any], bool]:
 @dataclass
 class PreparedChatRequest:
     """``prepare_chat_request`` output: the outbound body before the session adds
-    its rendered ``input_ids``, and the renderer for this request."""
+    its rendered ``input_ids``, and the template args to render them with (the
+    dict the committed turn then records as ``turn_args``)."""
 
     body: dict[str, Any]
-    tito_tokenizer: TITOTokenizer
+    template_args: dict[str, Any]
 
 
 def prepare_chat_request(
@@ -73,25 +77,32 @@ def prepare_chat_request(
     tito_tokenizer: TITOTokenizer,
     *,
     config: SessionServerConfig,
-    turn_args: dict[str, Any],
+    turn_args: dict[str, Any] | None,
 ) -> PreparedChatRequest:
     """Decide the outbound arguments of a parsed chat request; shared verbatim
     by the v1 and v2 sessions.  Raises ``MessageValidationError`` (HTTP 400).
 
-    ``turn_args`` is what the turn this request continues recorded when it
-    committed (``TITOTokenizer.turn_args_for_commit``), empty for a new root.
+    ``turn_args`` is the template args the turn this request continues was
+    rendered with, ``None`` for a new root.
     """
     wire = decide_chat_request_args(client, config)
     try:
-        renderer = tito_tokenizer.for_request(client, turn_args=turn_args)
+        template_args = tito_tokenizer.template_args_for_request(client, turn_args=turn_args)
     except ValueError as e:
         raise MessageValidationError(str(e)) from e
-    if renderer.chat_template_kwargs:
-        # The wire carries the effective dict the renderer uses, so both sides render alike.
-        wire["chat_template_kwargs"] = dict(renderer.chat_template_kwargs)
+    # The wire carries exactly what the prompt is rendered with, so both sides agree:
+    # the tools (possibly inherited from the continued turn) and the effective kwargs.
+    tools = template_args.get("tools")
+    kwargs = {key: value for key, value in template_args.items() if key != "tools"}
+    if tools:
+        wire["tools"] = tools
+    else:
+        wire.pop("tools", None)
+    if kwargs:
+        wire["chat_template_kwargs"] = kwargs
     else:
         wire.pop("chat_template_kwargs", None)
-    return PreparedChatRequest(body=wire, tito_tokenizer=renderer)
+    return PreparedChatRequest(body=wire, template_args=template_args)
 
 
 def decide_chat_request_args(client: dict[str, Any], config: SessionServerConfig) -> dict[str, Any]:

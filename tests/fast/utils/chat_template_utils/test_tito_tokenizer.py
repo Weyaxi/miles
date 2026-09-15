@@ -271,9 +271,11 @@ class TestConfig:
         tokenizer.convert_tokens_to_ids.return_value = 1
         startup_tito = tito_cls(tokenizer, chat_template_kwargs={"enable_thinking": False})
 
-        request_tito = startup_tito.clone_with_chat_template_kwargs({"thinking": True})
+        template_args = startup_tito.template_args_for_request(
+            {"chat_template_kwargs": {"thinking": True}}, turn_args=None
+        )
 
-        assert request_tito.chat_template_kwargs == {"drop_thinking": False, "thinking": True}
+        assert template_args == {"drop_thinking": False, "thinking": True}
 
     def test_comparator_inherits_trailing_ids(self, qwen3_tito: Qwen3TITOTokenizer):
         """create_comparator propagates trailing_token_ids to the comparator's trim set."""
@@ -281,55 +283,103 @@ class TestConfig:
         assert comp._trim_trailing_ids == set(qwen3_tito.trailing_token_ids)
 
 
-class TestSessionRequestKwargs:
-    """``for_request`` / ``for_turn`` / ``turn_args_for_commit``: the renderer a
-    session-server request gets and what a committed turn records for the
-    requests that continue it."""
+class TestTemplateArgsForRequest:
+    """``template_args_for_request``: the one dict a session-server request
+    renders with, and what a request continuing a recorded turn may change."""
 
-    def test_first_turn_merges_request_kwargs_over_the_launch_and_records_them(self):
-        launch = TITOTokenizer(MagicMock(), chat_template_kwargs={"enable_thinking": False})
+    LAUNCH = {"enable_thinking": False}
+    TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]
+    OTHER_TOOLS = [{"type": "function", "function": {"name": "get_time"}}]
 
-        renderer = launch.for_request({"chat_template_kwargs": {"enable_thinking": True}}, turn_args={})
+    def test_new_root_merges_request_kwargs_over_the_launch_and_takes_the_request_tools(self):
+        launch = TITOTokenizer(MagicMock(), chat_template_kwargs=self.LAUNCH)
 
-        assert renderer.chat_template_kwargs == {"enable_thinking": True}
-        assert renderer.turn_args_for_commit({"id": "r1"}) == {"chat_template_kwargs": {"enable_thinking": True}}
+        args = launch.template_args_for_request(
+            {"chat_template_kwargs": {"enable_thinking": True}, "tools": self.TOOLS}, turn_args=None
+        )
 
-    def test_request_without_kwargs_renders_like_the_launch(self):
-        launch = TITOTokenizer(MagicMock(), chat_template_kwargs={"enable_thinking": False})
-        renderer = launch.for_request({"messages": []}, turn_args={})
-        assert renderer.chat_template_kwargs == {"enable_thinking": False}
-        assert launch.for_turn({}) is launch
+        assert args == {"enable_thinking": True, "tools": self.TOOLS}
+        assert args["tools"] is self.TOOLS  # as sent: the wire and the record keep the client's spelling
 
-    def test_non_object_kwargs_are_refused(self):
+    def test_request_without_kwargs_or_tools_renders_like_the_launch(self):
+        launch = TITOTokenizer(MagicMock(), chat_template_kwargs=self.LAUNCH)
+        assert launch.template_args_for_request({"messages": []}, turn_args=None) == self.LAUNCH
+        assert (
+            launch.template_args_for_request({"chat_template_kwargs": None, "tools": []}, turn_args=None)
+            == self.LAUNCH
+        )
+
+    def test_malformed_kwargs_are_refused(self):
+        launch = TITOTokenizer(MagicMock())
         with pytest.raises(ValueError, match="chat_template_kwargs must be an object"):
-            TITOTokenizer(MagicMock()).for_request({"chat_template_kwargs": "oops"}, turn_args={})
+            launch.template_args_for_request({"chat_template_kwargs": "oops"}, turn_args=None)
+        with pytest.raises(ValueError, match="tools belongs at the top level"):
+            launch.template_args_for_request({"chat_template_kwargs": {"tools": self.TOOLS}}, turn_args=None)
 
-    def test_recorded_kwargs_are_inherited_and_fixed(self):
-        launch = TITOTokenizer(MagicMock(), chat_template_kwargs={"enable_thinking": False})
-        recorded = {"chat_template_kwargs": {"enable_thinking": True}}
+    def test_continued_turn_inherits_omitted_kwargs_and_refuses_a_change(self):
+        launch = TITOTokenizer(MagicMock(), chat_template_kwargs=self.LAUNCH)
+        recorded = {"enable_thinking": True}
 
-        assert launch.for_turn(recorded).chat_template_kwargs == {"enable_thinking": True}
-        assert launch.for_request({}, turn_args=recorded).chat_template_kwargs == {"enable_thinking": True}
-        same = launch.for_request({"chat_template_kwargs": {"enable_thinking": True}}, turn_args=recorded)
-        assert same.chat_template_kwargs == {"enable_thinking": True}
+        assert launch.template_args_for_request({}, turn_args=recorded) == recorded
+        same = launch.template_args_for_request(
+            {"chat_template_kwargs": {"enable_thinking": True}}, turn_args=recorded
+        )
+        assert same == recorded
         with pytest.raises(ValueError, match="was rendered with"):
-            launch.for_request({"chat_template_kwargs": {"enable_thinking": False}}, turn_args=recorded)
+            launch.template_args_for_request({"chat_template_kwargs": {"enable_thinking": False}}, turn_args=recorded)
+
+    def test_an_empty_record_is_a_continued_turn_not_a_new_root(self):
+        launch = TITOTokenizer(MagicMock(), chat_template_kwargs=self.LAUNCH)
+        # A root rendered with no kwargs at all records {}; continuing it may not add any.
+        assert launch.template_args_for_request({}, turn_args={}) == {}
+        with pytest.raises(ValueError, match="was rendered with"):
+            launch.template_args_for_request({"chat_template_kwargs": {"enable_thinking": False}}, turn_args={})
+
+    def test_continued_turn_tools_inherit_pass_or_are_refused(self):
+        launch = TITOTokenizer(MagicMock())
+        recorded = {"tools": self.TOOLS}
+
+        assert launch.template_args_for_request({}, turn_args=recorded) == {"tools": self.TOOLS}
+        bare = [tool["function"] for tool in self.TOOLS]  # the same tools in the other accepted spelling
+        assert launch.template_args_for_request({"tools": bare}, turn_args=recorded) == {"tools": bare}
+        with pytest.raises(ValueError, match="tools changed on a continued turn"):
+            launch.template_args_for_request({"tools": self.OTHER_TOOLS}, turn_args=recorded)
+        with pytest.raises(ValueError, match="tools changed on a continued turn"):
+            launch.template_args_for_request({"tools": self.TOOLS}, turn_args={})  # the turn had none
+
+    def test_a_family_may_allow_tools_to_change_mid_session(self):
+        class _ToolsAtTheTailTITOTokenizer(TITOTokenizer):
+            def tools_for_continued_turn(self, requested, *, recorded):
+                return requested if requested is not None else recorded
+
+        family = _ToolsAtTheTailTITOTokenizer(MagicMock())
+        args = family.template_args_for_request({"tools": self.OTHER_TOOLS}, turn_args={"tools": self.TOOLS})
+        assert args == {"tools": self.OTHER_TOOLS}
 
     def test_family_constants_are_kept_and_a_conflict_is_refused(self, qwen3_tito: Qwen3TITOTokenizer):
-        renderer = qwen3_tito.for_request({"chat_template_kwargs": {"enable_thinking": True}}, turn_args={})
-        assert renderer.chat_template_kwargs == {"clear_thinking": False, "enable_thinking": True}
+        args = qwen3_tito.template_args_for_request(
+            {"chat_template_kwargs": {"enable_thinking": True}}, turn_args=None
+        )
+        assert args == {"clear_thinking": False, "enable_thinking": True}
         with pytest.raises(ValueError, match="conflicts with the value registered"):
-            qwen3_tito.for_request({"chat_template_kwargs": {"clear_thinking": True}}, turn_args={})
+            qwen3_tito.template_args_for_request({"chat_template_kwargs": {"clear_thinking": True}}, turn_args=None)
 
     @pytest.mark.parametrize("tito_cls", [DeepSeekV32TITOTokenizer, DeepSeekV4TITOTokenizer])
-    def test_deepseek_alias_group_is_replaced_as_a_whole(self, tito_cls):
+    def test_deepseek_aliases_resolve_to_one_thinking_flag_so_spellings_compare_equal(self, tito_cls):
         tokenizer = MagicMock()
         tokenizer.convert_tokens_to_ids.return_value = 1
         launch = tito_cls(tokenizer, chat_template_kwargs={"enable_thinking": False})
+        assert launch.chat_template_kwargs == {"drop_thinking": False, "thinking": False}
 
-        renderer = launch.for_request({"chat_template_kwargs": {"thinking": True}}, turn_args={})
-
-        assert renderer.chat_template_kwargs == {"drop_thinking": False, "thinking": True}
+        recorded = launch.template_args_for_request({"chat_template_kwargs": {"thinking": True}}, turn_args=None)
+        assert recorded == {"drop_thinking": False, "thinking": True}
+        # Another spelling of the same mode continues the turn; the other mode does not.
+        same = launch.template_args_for_request(
+            {"chat_template_kwargs": {"enable_thinking": True}}, turn_args=recorded
+        )
+        assert same == recorded
+        with pytest.raises(ValueError, match="was rendered with"):
+            launch.template_args_for_request({"chat_template_kwargs": {"thinking_mode": "chat"}}, turn_args=recorded)
 
 
 class TestCompletionPostprocess:

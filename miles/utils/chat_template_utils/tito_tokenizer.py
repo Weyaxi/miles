@@ -107,79 +107,95 @@ class TITOTokenizer:
         special_token_ids: set[int] | None = None,
     ):
         self.tokenizer = tokenizer
-        provided_kwargs = dict(chat_template_kwargs or {})
-        for key, value in self.FIXED_TEMPLATE.extra_kwargs.items():
-            if key in provided_kwargs and provided_kwargs[key] != value:
-                raise ValueError(
-                    f"chat template kwarg {key}={provided_kwargs[key]!r} conflicts with "
-                    f"the value registered for {type(self).__name__}: {value!r}"
-                )
-            provided_kwargs[key] = value
-        self.chat_template_kwargs = provided_kwargs
+        # The launch kwargs in the family's canonical form: the base of every new root's template args.
+        self.chat_template_kwargs = self.canonical_kwargs(dict(chat_template_kwargs or {}))
         self._assistant_start_str = assistant_start_str
         self.allowed_append_roles = self.FIXED_TEMPLATE.allowed_append_roles
         self.special_token_ids: set[int] = special_token_ids
 
-    def clone_with_chat_template_kwargs(self, request_kwargs: dict[str, Any]) -> TITOTokenizer:
-        """Create a request-scoped copy with negligible overhead."""
-        return self.with_chat_template_kwargs(
-            template.merge_chat_template_kwargs(
-                self.chat_template_kwargs,
-                request_kwargs,
-                alias_keys=self.chat_template_kwarg_aliases,
-            )
-        )
+    # --- session server: the template args of one request -----------------
+    # ``template_args`` is one dict: every keyword ``template.apply_chat_template``
+    # takes besides the messages, ``tools`` included.  The session server
+    # resolves it once per request here, renders the prompt with it, puts it
+    # on the wire and records it on the committed turn as ``turn_args``; a
+    # request continuing that turn gets it back.  Families override the part
+    # that is theirs: ``canonical_kwargs`` (alias keys, fixed constants),
+    # ``tools_for_continued_turn`` (whether tools may change mid-session), or
+    # ``template_args_for_request`` itself for families that read other
+    # request fields into the template (Qwen3.8's ``reasoning_effort``),
+    # folding them into a copy of the request's ``chat_template_kwargs``
+    # before calling ``super()``.
 
-    def with_chat_template_kwargs(self, chat_template_kwargs: dict[str, Any]) -> TITOTokenizer:
-        """A copy that renders with exactly ``chat_template_kwargs`` (no merge with this instance's)."""
-        return type(self)(
-            self.tokenizer,
-            chat_template_kwargs=chat_template_kwargs,
-            assistant_start_str=self._assistant_start_str,
-        )
+    def canonical_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """The family's canonical form of a template-kwargs dict (no ``tools``):
+        the fixed template's constants applied, a conflicting value refused.
+        Families with alias keys resolve them here.  Idempotent; the
+        constructor runs the launch kwargs through it too."""
+        canonical = dict(kwargs)
+        for key, value in self.FIXED_TEMPLATE.extra_kwargs.items():
+            if key in canonical and canonical[key] != value:
+                raise ValueError(
+                    f"chat template kwarg {key}={canonical[key]!r} conflicts with "
+                    f"the value registered for {type(self).__name__}: {value!r}"
+                )
+            canonical[key] = value
+        return canonical
 
-    # --- session server: template kwargs per request and per turn ----------
-    # ``turn_args`` is the dict a committed generation records
-    # (``turn_args_for_commit``); a request that continues that generation
-    # gets it back.  The base class records the effective
-    # ``chat_template_kwargs``; a family that reads other request fields into
-    # the template (Qwen3.8's ``reasoning_effort``) overrides ``for_request``
-    # and calls ``super()``.
+    def template_args_for_request(self, client: dict[str, Any], *, turn_args: dict[str, Any] | None) -> dict[str, Any]:
+        """The ``template_args`` one session-server request renders with.
 
-    def for_turn(self, turn_args: dict[str, Any]) -> TITOTokenizer:
-        """The renderer a committed turn was rendered with: this launch
-        tokenizer when ``turn_args`` records no kwargs (a new root)."""
-        recorded = turn_args.get("chat_template_kwargs")
-        return self if recorded is None else self.with_chat_template_kwargs(recorded)
-
-    def for_request(self, client: dict[str, Any], *, turn_args: dict[str, Any]) -> TITOTokenizer:
-        """The renderer for one session-server request that continues the turn
-        recorded as ``turn_args`` (empty when the request starts a new root).
-
-        The request's ``chat_template_kwargs`` are merged over that turn's
-        renderer (``for_turn``).  A continued turn fixes them: omitted keys
-        inherit and a request that would render differently is refused,
-        because the token history being continued has one interpretation.
-        Raises ``ValueError`` for a request the renderer refuses; the session
-        server turns that into a 400.
+        ``turn_args`` is what the turn this request continues was rendered
+        with; ``None`` when the request starts a new root.  A new root merges
+        the request's ``chat_template_kwargs`` over the launch kwargs.  A
+        continued turn merges them over that turn's: omitted keys inherit, and
+        a request that would render differently is refused, because the token
+        history being continued has one interpretation.  ``tools`` come from
+        the request; on a continued turn ``tools_for_continued_turn`` decides.
+        Raises ``ValueError`` for a refused request; the session server turns
+        that into HTTP 400.
         """
         request_kwargs = client.get("chat_template_kwargs")
-        if request_kwargs is not None and not isinstance(request_kwargs, dict):
+        if request_kwargs is None:
+            request_kwargs = {}
+        if not isinstance(request_kwargs, dict):
             raise ValueError("chat_template_kwargs must be an object")
-        base = self.for_turn(turn_args)
-        renderer = base.clone_with_chat_template_kwargs(request_kwargs) if request_kwargs else base
-        if turn_args and renderer.chat_template_kwargs != base.chat_template_kwargs:
-            raise ValueError(
-                f"chat_template_kwargs {renderer.chat_template_kwargs!r} is not accepted: the turn being "
-                f"continued was rendered with {base.chat_template_kwargs!r}"
-            )
-        return renderer
+        if "tools" in request_kwargs:
+            raise ValueError("tools belongs at the top level of the request, not in chat_template_kwargs")
 
-    def turn_args_for_commit(self, response: dict[str, Any]) -> dict[str, Any]:
-        """What a turn rendered by this renderer records when it commits: the
-        kwargs every turn continuing it must render with.  ``response`` is the
-        committed chat completion, for families whose reply settles something."""
-        return {"chat_template_kwargs": dict(self.chat_template_kwargs)}
+        recorded = None if turn_args is None else {key: value for key, value in turn_args.items() if key != "tools"}
+        base = self.chat_template_kwargs if recorded is None else recorded
+        kwargs = self.canonical_kwargs(
+            template.merge_chat_template_kwargs(base, request_kwargs, alias_keys=self.chat_template_kwarg_aliases)
+        )
+        if recorded is not None and kwargs != recorded:
+            raise ValueError(
+                f"chat_template_kwargs {kwargs!r} is not accepted: the turn being continued "
+                f"was rendered with {recorded!r}"
+            )
+
+        tools = client.get("tools") or None
+        if turn_args is not None:
+            tools = self.tools_for_continued_turn(tools, recorded=turn_args.get("tools"))
+        return {**kwargs, **({"tools": tools} if tools else {})}
+
+    def tools_for_continued_turn(
+        self, requested: list[dict[str, Any]] | None, *, recorded: list[dict[str, Any]] | None
+    ) -> list[dict[str, Any]] | None:
+        """The tools a request continuing a turn rendered with *recorded* tools
+        renders with.  Omitted tools inherit the recorded ones: they are in the
+        prompt prefix already, and the wire must declare them for the tool-call
+        parser.  Equal tools (compared canonicalized) pass.  A change is refused
+        because this family renders tools in the prompt prefix, which a continued
+        turn reuses as-is; a family whose template lets an appended turn carry
+        new tools overrides this."""
+        if requested is None:
+            return recorded
+        if template.extract_tool_dicts(requested) != template.extract_tool_dicts(recorded):
+            raise ValueError(
+                "tools changed on a continued turn: the turn being continued was rendered with different tools, "
+                "and this model family renders tools in the prompt prefix"
+            )
+        return requested
 
     def create_comparator(self) -> TokenSeqComparator:
         """Create a :class:`TokenSeqComparator` configured with this
@@ -775,10 +791,16 @@ class DeepSeekV32TITOTokenizer(TITOTokenizer):
                 tokenizer.convert_tokens_to_ids("<｜Assistant｜>"),
             },
         )
-        self.chat_template_kwargs = {
-            **self.chat_template_kwargs,
-            "thinking": deepseek.V32.render_thinking_enabled(self.chat_template_kwargs),
-        }
+
+    def canonical_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Resolve the thinking-mode alias group to one explicit ``thinking``
+        flag, the key sglang's DeepSeek reasoning parser reads from the request."""
+        canonical = super().canonical_kwargs(kwargs)
+        thinking = deepseek.V32.render_thinking_enabled(canonical)
+        for alias in _DEEPSEEK_MODE_KWARG_ALIASES:
+            canonical.pop(alias, None)
+        canonical["thinking"] = thinking
+        return canonical
 
 
 # ---------------------------------------------------------------------------
@@ -828,13 +850,18 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
             tokenizer.convert_tokens_to_ids("</think>"),
         }
         self.trailing_token_ids = frozenset({self._assistant_id} | self._think_bracket_ids)
-        # sglang's dsv4 parser separates reasoning only when the request carries
-        # `thinking` (DeepSeek-V3.1's template kwarg, kept for the V4 family);
-        # make the effective render mode explicit so the session server forwards it.
-        self.chat_template_kwargs = {
-            **self.chat_template_kwargs,
-            "thinking": deepseek.V4.render_thinking_enabled(self.chat_template_kwargs),
-        }
+
+    def canonical_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Resolve the thinking-mode alias group to one explicit ``thinking``
+        flag: sglang's dsv4 parser separates reasoning only when the request
+        carries ``thinking`` (DeepSeek-V3.1's template kwarg, kept for V4), so
+        the session server must forward the effective mode under that key."""
+        canonical = super().canonical_kwargs(kwargs)
+        thinking = deepseek.V4.render_thinking_enabled(canonical)
+        for alias in _DEEPSEEK_MODE_KWARG_ALIASES:
+            canonical.pop(alias, None)
+        canonical["thinking"] = thinking
+        return canonical
 
     def tokenize_additional_messages(
         self,

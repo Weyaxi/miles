@@ -331,7 +331,7 @@ class SessionCore:
                 tito_tokenizer=self.registry.tito_tokenizer,
                 message_matcher=self.registry.message_matcher,
             )
-            request_body, tito_tokenizer = prepared.body, prepared.tito_tokenizer
+            request_body, tito_tokenizer = prepared.body, self.registry.tito_tokenizer
             request_messages = request_body.get("messages", [])
             prompt_token_ids = request_body["input_ids"]
             logger.debug("Using TITO input_ids: %d tokens", len(prompt_token_ids))
@@ -386,7 +386,7 @@ class SessionCore:
                 prompt_token_ids=prompt_token_ids,
                 completion_token_ids=completion_token_ids,
                 max_trim_tokens=self.registry.tito_tokenizer.max_trim_tokens,
-                turn_args=tito_tokenizer.turn_args_for_commit(response),
+                turn_args=prepared.template_args,
             )
 
             record = SessionRecord(

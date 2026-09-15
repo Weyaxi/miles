@@ -1,8 +1,9 @@
 """HTTP-level tests for how the session server decides outbound chat-request arguments.
 
 Body fields: ``request_args.decide_chat_request_args`` (what the server owns, what
-it rejects, what it forwards).  ``chat_template_kwargs``: ``TITOTokenizer.for_request``
-against the ``turn_args`` recorded by the turn a request continues.
+it rejects, what it forwards).  Template args (``chat_template_kwargs`` and ``tools``):
+``TITOTokenizer.template_args_for_request`` against the ``turn_args`` recorded by the
+turn a request continues.
 """
 
 import asyncio
@@ -21,6 +22,10 @@ from miles.utils.test_utils.mock_sglang_server import MockSGLangServer
 USER = {"role": "user", "content": "hi"}
 LAUNCH_KWARGS = {"enable_thinking": False}  # both ``_serve_router`` helpers launch with this
 THINKING_ON = {"enable_thinking": True}
+TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}}}]
+OTHER_TOOLS = [
+    {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
+]
 
 
 def _serve(version: str, extra_args: dict | None = None):
@@ -121,10 +126,17 @@ class TestChatTemplateKwargs:
             assert resp.status_code == 400
             assert resp.json()["error"] == "chat_template_kwargs must be an object"
 
+    def test_tools_inside_chat_template_kwargs_is_400(self):
+        with _serve_router() as env:
+            session_id = _create_session(env.url)
+            resp = _post_chat(env.url, session_id, {"messages": [USER], "chat_template_kwargs": {"tools": TOOLS}})
+            assert resp.status_code == 400
+            assert "tools belongs at the top level" in resp.json()["error"]
+
 
 @pytest.mark.parametrize("version", ["v1", "v2"])
 class TestTurnArgs:
-    """A committed turn records its kwargs; a request continuing it renders alike."""
+    """A committed turn records its template args; a request continuing it renders alike."""
 
     def _turn(self, env, session_id: str, messages: list, **extra) -> requests.Response:
         return _post_chat(env.url, session_id, {"messages": messages, **extra})
@@ -136,7 +148,7 @@ class TestTurnArgs:
 
             first = self._turn(env, session_id, [USER], chat_template_kwargs=THINKING_ON)
             assert first.status_code == 200
-            assert _metadata(env.url, session_id)["turn_args"] == {"chat_template_kwargs": THINKING_ON}
+            assert _metadata(env.url, session_id)["turn_args"] == THINKING_ON
             assistant = first.json()["choices"][0]["message"]
             history = [USER, assistant, {"role": "user", "content": "more"}]
 
@@ -161,6 +173,23 @@ class TestTurnArgs:
             else:
                 assert len(_metadata(env.url, session_id)["tree"]["nodes"]) == 3
 
+    def test_continuing_a_turn_inherits_its_tools_and_rejects_a_change(self, version):
+        with _serve(version) as env:
+            session_id = _create_session(env.url)
+            first = self._turn(env, session_id, [USER], tools=TOOLS)
+            assert first.status_code == 200
+            assert _metadata(env.url, session_id)["turn_args"] == {**LAUNCH_KWARGS, "tools": TOOLS}
+            assistant = first.json()["choices"][0]["message"]
+            history = [USER, assistant, {"role": "user", "content": "more"}]
+
+            second = self._turn(env, session_id, history)  # tools omitted: inherited, and back on the wire
+            assert second.status_code == 200
+            assert env.backend.request_log[-1]["tools"] == TOOLS
+
+            third = self._turn(env, session_id, history, tools=OTHER_TOOLS)
+            assert third.status_code == 400
+            assert "tools changed on a continued turn" in third.json()["error"]
+
     def test_a_new_root_may_choose_again(self, version):
         """v1: retrying the first turn rolls back to the empty checkpoint; v2: a second root."""
         with _serve(version) as env:
@@ -171,13 +200,13 @@ class TestTurnArgs:
             assert again.status_code == 200
             assert env.backend.request_log[-1]["chat_template_kwargs"] == LAUNCH_KWARGS
             metadata = _metadata(env.url, session_id)
-            assert metadata["turn_args"] == {"chat_template_kwargs": LAUNCH_KWARGS}
+            assert metadata["turn_args"] == LAUNCH_KWARGS
             if version == "v1":
                 assert len(_records(env.url, session_id)) == 1
             else:
                 nodes = metadata["tree"]["nodes"]
                 assert [node["parent"] for node in nodes] == [None, None]
-                assert [node["turn_args"]["chat_template_kwargs"] for node in nodes] == [THINKING_ON, LAUNCH_KWARGS]
+                assert [node["turn_args"] for node in nodes] == [THINKING_ON, LAUNCH_KWARGS]
 
     def test_failed_turn_records_nothing(self, version):
         original = MockSGLangServer._handle_generate_like_request
@@ -196,7 +225,7 @@ class TestTurnArgs:
                 assert _metadata(env.url, session_id)["turn_args"] == {}
                 assert self._turn(env, session_id, [USER]).status_code == 200
             assert env.backend.request_log[-1]["chat_template_kwargs"] == LAUNCH_KWARGS
-            assert _metadata(env.url, session_id)["turn_args"] == {"chat_template_kwargs": LAUNCH_KWARGS}
+            assert _metadata(env.url, session_id)["turn_args"] == LAUNCH_KWARGS
 
 
 def test_v2_concurrent_first_turns_with_different_kwargs_both_commit_as_roots():
@@ -229,7 +258,7 @@ def test_v2_concurrent_first_turns_with_different_kwargs_both_commit_as_roots():
         assert all(response.status_code == 200 for response in responses)
         nodes = _metadata(env.url, session_id)["tree"]["nodes"]
         assert [node["parent"] for node in nodes] == [None, None]
-        assert sorted(node["turn_args"]["chat_template_kwargs"]["enable_thinking"] for node in nodes) == [False, True]
+        assert sorted(node["turn_args"]["enable_thinking"] for node in nodes) == [False, True]
 
         # Continuing either root must render like that root.
         [record] = _records(env.url, session_id)  # the served chain: the root committed last

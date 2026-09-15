@@ -1,13 +1,21 @@
-"""Unit tests for ``miles.rollout.session.request_args``: the two field functions
-and ``decide_chat_request_args``, which applies them to a client body."""
+"""Unit tests for ``miles.rollout.session.request_args``: the two field functions,
+``decide_chat_request_args``, which applies them to a client body, and
+``prepare_chat_request``, which adds the template args and puts them on the wire."""
 
 import logging
+from unittest.mock import MagicMock
 
 import pytest
 from tests.fast.fixtures.session_fixtures import make_session_server_config
 
 from miles.rollout.session.errors import MessageValidationError
-from miles.rollout.session.request_args import decide_chat_request_args, server_first, server_strict
+from miles.rollout.session.request_args import (
+    decide_chat_request_args,
+    prepare_chat_request,
+    server_first,
+    server_strict,
+)
+from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizer
 from miles.utils.lora import LORA_ADAPTER_NAME
 
 ARGS_LOGGER = "miles.rollout.session.request_args"
@@ -99,3 +107,54 @@ class TestDecideChatRequestArgs:
             decide_chat_request_args({"model": "base:adapter"}, make_session_server_config())["model"]
             == "base:adapter"
         )
+
+
+class TestPrepareChatRequest:
+    LAUNCH = {"enable_thinking": False}
+    TOOLS = [{"type": "function", "function": {"name": "get_weather"}}]
+
+    @staticmethod
+    def _tito(**kwargs) -> TITOTokenizer:
+        return TITOTokenizer(MagicMock(), **kwargs)
+
+    def test_wire_carries_the_template_args_the_prompt_is_rendered_with(self):
+        client = {"messages": [], "tools": self.TOOLS, "chat_template_kwargs": {"enable_thinking": True}}
+
+        prepared = prepare_chat_request(
+            client, self._tito(chat_template_kwargs=self.LAUNCH), config=make_session_server_config(), turn_args=None
+        )
+
+        assert prepared.template_args == {"enable_thinking": True, "tools": self.TOOLS}
+        assert prepared.body["tools"] == self.TOOLS
+        assert prepared.body["chat_template_kwargs"] == {"enable_thinking": True}
+        assert prepared.body["logprobs"] is True  # decide_chat_request_args ran on the same body
+
+    def test_inherited_tools_reach_the_wire_and_empty_template_args_leave_it(self):
+        recorded = {**self.LAUNCH, "tools": self.TOOLS}
+        prepared = prepare_chat_request(
+            {"messages": [], "tools": []},
+            self._tito(chat_template_kwargs=self.LAUNCH),
+            config=make_session_server_config(),
+            turn_args=recorded,
+        )
+        assert prepared.body["tools"] == self.TOOLS
+        assert prepared.body["chat_template_kwargs"] == self.LAUNCH
+
+        prepared = prepare_chat_request(
+            {"messages": [], "tools": [], "chat_template_kwargs": {}},
+            self._tito(),
+            config=make_session_server_config(),
+            turn_args=None,
+        )
+        assert prepared.template_args == {}
+        assert "tools" not in prepared.body and "chat_template_kwargs" not in prepared.body
+
+    def test_a_refused_request_is_a_400(self):
+        with pytest.raises(MessageValidationError, match="was rendered with") as excinfo:
+            prepare_chat_request(
+                {"messages": [], "chat_template_kwargs": {"enable_thinking": True}},
+                self._tito(chat_template_kwargs=self.LAUNCH),
+                config=make_session_server_config(),
+                turn_args=self.LAUNCH,
+            )
+        assert excinfo.value.status_code == 400

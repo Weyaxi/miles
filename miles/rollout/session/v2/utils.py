@@ -81,7 +81,6 @@ def build_leaf_material(
             sample = merge_samples_with_addition_r3(args, turns, records, registry.tokenizer)
         else:
             sample = merge_samples(turns, registry.tokenizer)
-        tools = path[-1].record.request.get("tools")
         flat: dict[str, Any] = {
             "accumulated_token_ids": list(leaf.token_ids),
             "turn_args": leaf.turn_args,
@@ -93,12 +92,7 @@ def build_leaf_material(
             },
         }
         try:
-            mismatch = registry.compute_mismatch(
-                leaf.path_messages(),
-                leaf.token_ids,
-                tools,
-                turn_args=leaf.turn_args,
-            )
+            mismatch = registry.compute_mismatch(leaf.path_messages(), leaf.token_ids, turn_args=leaf.turn_args)
         except TokenizationError:
             logger.exception("Failed to compute tito_session_mismatch for session %s", session_id)
             mismatch = None
