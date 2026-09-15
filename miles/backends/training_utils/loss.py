@@ -191,7 +191,7 @@ def loss_function(
         if apply_megatron_loss_scaling:
             loss = loss * parallel_state.cp.size
 
-    per_datum = log.pop("per_datum", None)
+    per_datum = log.pop("per_datum", None) if batch.get("loss_fn") is not None else None
     return (
         loss,
         torch.tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device),

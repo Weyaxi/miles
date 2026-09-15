@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 async def serve(args):
     assert args.multi_lora, "serve_tinker requires --multi-lora-n-adapters > 0"
     assert args.load == args.hf_checkpoint, "Tinker trainers and engines must load the same frozen HF base"
+    checkpoint_root = args.tinker_checkpoint_root or (args.save and f"{args.save}/tinker")
+    assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
     configure_logger(args, source=MainProcessIdentity())
 
     init_http_client(args)
@@ -44,8 +46,6 @@ async def serve(args):
     )
     await trainer.init()
 
-    checkpoint_root = args.tinker_checkpoint_root or (args.save and f"{args.save}/tinker")
-    assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
     target_modules = set(convert_target_modules_to_hf(args.target_modules))
     config = GatewayConfig(
         base_model=args.tinker_base_model or args.hf_checkpoint,
