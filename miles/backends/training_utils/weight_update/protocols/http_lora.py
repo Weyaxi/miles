@@ -33,6 +33,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import time
 from argparse import Namespace
 from collections.abc import Callable, Sequence
@@ -44,6 +45,11 @@ from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
+from miles.backends.training_utils.weight_update.session import (
+    pause_engines,
+    resume_engines,
+    set_weight_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +68,23 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
     def __init__(self, args: Namespace) -> None:
         super().__init__(args)
         self._buf: dict[str, torch.Tensor] = {}
-        self._stage_root: str = getattr(args, "update_weight_disk_dir", None) or "/tmp/miles_lora_sync"
+        # Validation already asserts --update-weight-disk-dir for this mode, so a
+        # fallback here would be unreachable.
+        self._stage_root: str = args.update_weight_disk_dir
+        # Per-slot rank/alpha are not visible to a transport (send_bucket carries
+        # only "{lora_name}:{hf_key}"), so a multi-LoRA run would be published with
+        # the wrong config. Refuse rather than mislabel it.
+        from miles.utils.multi_lora import is_multi_lora_enabled
+
+        assert not is_multi_lora_enabled(args), (
+            "http-lora does not support multi-LoRA yet: per-adapter rank/alpha are not "
+            "available to a weight-transfer protocol, so adapters would be published "
+            "with the global --lora-rank/--lora-alpha."
+        )
+        self._keep_versions: int = int(getattr(args, "http_lora_keep_versions", 3) or 0)
+        # 1800s per engine meant a single wedged engine stalled training for half
+        # an hour before anyone saw it. A load is a file read on the engine host.
+        self._load_timeout_s: float = float(getattr(args, "http_lora_load_timeout", 300.0))
         self._post_write_hook: Callable | None = None
         if getattr(args, "custom_update_weight_post_write_path", None):
             from miles.utils.function_registry import load_function
@@ -115,35 +137,49 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
             by_adapter.setdefault(lora_name, {})[hf_key] = tensor
         self._buf.clear()
 
-        for lora_name, tensors in by_adapter.items():
-            t0 = time.time()
-            local_dir = self._write_adapter(lora_name, weight_version, tensors)
-            nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
-            t_write = time.time() - t0
+        # The engines keep serving while the adapter is swapped unless we stop
+        # them. The updater's session frame normally does this; this protocol
+        # opts out of that frame, so it owns the pause itself.
+        engines = list(self.rollout_engines or [])
+        pause_engines(self.args, engines)
+        try:
+            for lora_name, tensors in by_adapter.items():
+                t0 = time.time()
+                local_dir = self._write_adapter(lora_name, weight_version, tensors)
+                nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
+                t_write = time.time() - t0
 
-            t0 = time.time()
-            # Same escape hatch disk-delta uses: when the staging dir is not
-            # genuinely shared with the engine hosts, the operator supplies
-            # --custom-update-weight-post-write-path to replicate it (rsync, an
-            # object store, whatever their cluster uses). Inventing a second
-            # copy mechanism here would duplicate that contract.
-            if self._post_write_hook is not None:
-                self._post_write_hook(self.args, local_dir, list(self.rollout_engines or []))
-            t_ship = time.time() - t0
+                t0 = time.time()
+                # Same escape hatch disk-delta uses: when the staging dir is not
+                # genuinely shared with the engine hosts, the operator supplies
+                # --custom-update-weight-post-write-path to replicate it.
+                if self._post_write_hook is not None:
+                    self._post_write_hook(self.args, local_dir, engines)
+                t_ship = time.time() - t0
 
-            t0 = time.time()
-            self._load_everywhere(lora_name, local_dir)
-            t_load = time.time() - t0
+                t0 = time.time()
+                self._load_everywhere(lora_name, local_dir)
+                t_load = time.time() - t0
 
-            self.update_weight_metrics.update({
-                "http_lora/bytes": float(nbytes), "http_lora/write_s": t_write,
-                "http_lora/ship_s": t_ship, "http_lora/load_s": t_load,
-            })
-            logger.info(
-                "http-lora: %s v%d  %.0f MB  write %.1fs  ship %.1fs  load %.1fs  -> %d engine(s)",
-                lora_name, weight_version, nbytes / 1e6, t_write, t_ship, t_load,
-                len(self.rollout_engines or []),
-            )
+                self._prune_old_versions(lora_name, weight_version)
+
+                # Namespaced per adapter: a shared key set would leave only the
+                # last adapter's numbers on the step log.
+                self.update_weight_metrics.update({
+                    f"http_lora/{lora_name}/bytes": float(nbytes),
+                    f"http_lora/{lora_name}/write_s": t_write,
+                    f"http_lora/{lora_name}/ship_s": t_ship,
+                    f"http_lora/{lora_name}/load_s": t_load,
+                })
+                logger.info(
+                    "http-lora: %s v%d  %.0f MB  write %.1fs  ship %.1fs  load %.1fs  -> %d engine(s)",
+                    lora_name, weight_version, nbytes / 1e6, t_write, t_ship, t_load, len(engines),
+                )
+            # Without this the engines report a stale version forever and any
+            # staleness / off-policy-lag accounting downstream is wrong.
+            set_weight_version(engines, weight_version)
+        finally:
+            resume_engines(engines)
 
     # ---------------------------------------------------------------- helpers
 
@@ -159,8 +195,10 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
         os.replace(tmp, os.path.join(d, "adapter_model.safetensors"))  # atomic publish
 
         cfg = self._adapter_config(tensors)
-        with open(os.path.join(d, "adapter_config.json"), "w") as fh:
+        cfg_tmp = os.path.join(d, ".adapter_config.json.tmp")
+        with open(cfg_tmp, "w") as fh:
             json.dump(cfg, fh, indent=2)
+        os.replace(cfg_tmp, os.path.join(d, "adapter_config.json"))  # atomic, like the weights
 
         # Consumed by a different process and often a different user (trainer as
         # root in a container, shipper not). safetensors writes 0600, so without
@@ -170,6 +208,14 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
             with contextlib.suppress(OSError):
                 os.chmod(os.path.join(d, f), 0o644)
         return d
+
+    @staticmethod
+    def _infer_rank(tensors: dict[str, torch.Tensor]) -> int | None:
+        """lora_A is [r, in], so the rank is readable off the weights."""
+        for k, v in tensors.items():
+            if k.endswith(".lora_A.weight") and v.dim() >= 2:
+                return int(v.shape[-2])
+        return None
 
     def _adapter_config(self, tensors: dict[str, torch.Tensor]) -> dict:
         """PEFT-shaped config. Target modules come from the tensors we actually
@@ -190,8 +236,11 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
         return {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "r": int(getattr(args, "lora_rank", 0)),
-            "lora_alpha": int(getattr(args, "lora_alpha", 0)),
+            # Derived from the tensors actually present, for the same reason
+            # target_modules is: the published config should describe the file,
+            # not the run's flags.
+            "r": self._infer_rank(tensors) or int(getattr(args, "lora_rank", 0)),
+            "lora_alpha": float(getattr(args, "lora_alpha", 0)),
             "lora_dropout": float(getattr(args, "lora_dropout", 0.0) or 0.0),
             "bias": "none",
             "inference_mode": True,
@@ -199,20 +248,77 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
             "exclude_modules": exclude,
         }
 
-    def _load_everywhere(self, lora_name: str, remote_dir: str) -> None:
-        """Register the staged adapter on every engine."""
+    @staticmethod
+    def _is_name_conflict(resp) -> bool:
+        """The engine already holds this adapter name.
+
+        SGLang's registry raises ``LoRA with name X already exists`` on a second
+        registration (lora_registry.py). The updater hands us a STABLE name every
+        sync (``LORA_ADAPTER_NAME``, or ``slot_lora_name(slot)``), so every sync
+        after the first collides. This is the ONLY place that string is accepted,
+        and it triggers a replace -- never a success. Treating it as success is
+        how a run silently keeps serving the step-1 adapter while training moves on.
+        """
+        body = (resp.text or "").lower()
+        return "already exists" in body or "already loaded" in body
+
+    def _load_one(self, base: str, lora_name: str, remote_dir: str) -> None:
         import httpx
 
-        for eng in self.rollout_engines or []:
-            base = eng.server_url.rstrip("/")
-            try:
-                r = httpx.post(
-                    base + "/load_lora_adapter",
-                    json={"lora_name": lora_name, "lora_path": remote_dir, "pinned": False},
-                    timeout=1800.0,
+        payload = {"lora_name": lora_name, "lora_path": remote_dir, "pinned": False}
+        with httpx.Client(timeout=self._load_timeout_s) as client:
+            r = client.post(base + "/load_lora_adapter", json=payload)
+            if r.status_code == 200:
+                return
+            if not self._is_name_conflict(r):
+                raise RuntimeError(f"http-lora: load failed on {base}: HTTP {r.status_code} {r.text[:200]}")
+
+            # Replace in place. This build's LoadLoRAAdapterReqInput has no
+            # `upsert` field, so unload-then-load is the portable path; both
+            # routes exist on a stock server.
+            u = client.post(base + "/unload_lora_adapter", json={"lora_name": lora_name})
+            if u.status_code != 200:
+                raise RuntimeError(
+                    f"http-lora: {lora_name} already registered on {base} and unload failed: "
+                    f"HTTP {u.status_code} {u.text[:200]}"
                 )
-            except Exception as ex:  # noqa: BLE001
-                raise RuntimeError(f"http-lora: load failed on {base}: {type(ex).__name__}: {ex}") from ex
-            # A re-registered name is not an error: the engine already has it.
-            if r.status_code != 200 and "already" not in r.text.lower():
-                raise RuntimeError(f"http-lora: load failed on {base}: HTTP {r.status_code} {r.text[:160]}")
+            r = client.post(base + "/load_lora_adapter", json=payload)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"http-lora: reload after unload failed on {base}: HTTP {r.status_code} {r.text[:200]}"
+                )
+
+    def _load_everywhere(self, lora_name: str, remote_dir: str) -> None:
+        """Install the staged adapter on every engine, in parallel.
+
+        Serial calls meant one slow engine stalled the whole sync for its full
+        timeout; the engines are independent, so fan out and surface the first
+        failure.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        bases = [eng.server_url.rstrip("/") for eng in self.rollout_engines or []]
+        if not bases:
+            return
+        with ThreadPoolExecutor(max_workers=len(bases)) as pool:
+            # list() re-raises the first exception instead of dropping it
+            list(pool.map(lambda b: self._load_one(b, lora_name, remote_dir), bases))
+
+    def _prune_old_versions(self, lora_name: str, current: int) -> None:
+        """Keep the few newest version dirs. Each sync writes a full adapter, so
+        an unbounded run would otherwise fill the staging volume."""
+        if self._keep_versions <= 0:
+            return
+        prefix = f"{lora_name}_v"
+        try:
+            versions = sorted(
+                int(d[len(prefix):]) for d in os.listdir(self._stage_root)
+                if d.startswith(prefix) and d[len(prefix):].isdigit()
+            )
+        except OSError:
+            return
+        for v in versions[: max(0, len(versions) - self._keep_versions)]:
+            if v == current:
+                continue
+            with contextlib.suppress(OSError):
+                shutil.rmtree(os.path.join(self._stage_root, f"{prefix}{v}"))
