@@ -109,10 +109,23 @@ def test_an_older_server_reporting_a_name_conflict_also_falls_back(tmp_path, mon
     assert [r for r, _ in c.calls].count("unload_lora_adapter") == 1
 
 
+def test_the_first_sync_survives_having_nothing_to_unload(tmp_path, monkeypatch):
+    """On a stock server the very first sync is: upsert rejected -> unload a name
+    that does not exist yet -> load. SGLang answers 400 'does not exist' there,
+    which must not be fatal."""
+    c = _FakeClient({
+        "load_lora_adapter": [_Resp(422, "unexpected keyword argument 'upsert'"), _Resp(200)],
+        "unload_lora_adapter": _Resp(400, "LoRA with name miles_lora does not exist. Loaded LoRAs: dict_keys([])"),
+    })
+    _patch_httpx(monkeypatch, c)
+    _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/miles_lora_v1")
+    assert [r for r, _ in c.calls][-1] == "load_lora_adapter"
+
+
 def test_a_failed_unload_is_an_error(tmp_path, monkeypatch):
     c = _FakeClient({
         "load_lora_adapter": [_Resp(400, "already exists")],
-        "unload_lora_adapter": _Resp(500, "boom"),
+        "unload_lora_adapter": _Resp(500, "internal error"),
     })
     _patch_httpx(monkeypatch, c)
     with pytest.raises(RuntimeError, match="unload failed"):

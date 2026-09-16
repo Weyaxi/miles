@@ -256,6 +256,13 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
         return "already exists" in body or "already loaded" in body
 
     @staticmethod
+    def _is_absent(resp) -> bool:
+        """Nothing registered under this name. On the FIRST sync there is nothing
+        to unload, and SGLang answers 400 "LoRA with name X does not exist"
+        rather than treating it as a no-op."""
+        return "does not exist" in (resp.text or "").lower()
+
+    @staticmethod
     def _rejected_upsert(resp) -> bool:
         """The engine does not know the ``upsert`` field.
 
@@ -302,7 +309,7 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
                 "unload+load, which briefly leaves %r unregistered", base, lora_name,
             )
             u = client.post(base + "/unload_lora_adapter", json={"lora_name": lora_name})
-            if u.status_code != 200 and not self._is_name_conflict(u):
+            if u.status_code != 200 and not self._is_absent(u):
                 raise RuntimeError(
                     f"http-lora: {lora_name!r} is registered on {base} and unload failed: "
                     f"HTTP {u.status_code} {u.text[:200]}"
