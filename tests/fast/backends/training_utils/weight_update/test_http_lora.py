@@ -66,42 +66,73 @@ def test_the_load_asks_the_engine_to_replace_in_place(tmp_path, monkeypatch):
     _patch_httpx(monkeypatch, c)
     _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/miles_lora_v1")
 
-    routes = [r for r, _ in c.calls]
-    assert routes == ["load_lora_adapter"]
+    assert [r for r, _ in c.calls] == ["load_lora_adapter"]
     assert c.calls[0][1]["upsert"] is True, (
         "the adapter name is stable across syncs, so the engine must replace the "
         "weights behind it rather than reject a duplicate registration"
     )
 
 
-def test_an_engine_that_will_not_replace_fails_loudly(tmp_path, monkeypatch):
-    """THE regression. Never report success, and never fall back to unload:
-    unload waits on in-flight requests that a paused engine cannot finish."""
+def test_a_server_without_upsert_falls_back_to_unload_then_load(tmp_path, monkeypatch):
+    """THE regression: sync 2+ must still change the served adapter.
+
+    The fallback is only safe unpaused -- unload waits on in-flight requests that
+    a paused engine never finishes -- so finalize must not pause around this.
+    """
     c = _FakeClient({
-        "load_lora_adapter": _Resp(400, "LoRA with name miles_lora already exists. Loaded LoRAs: ..."),
+        "load_lora_adapter": [
+            _Resp(422, "unexpected keyword argument 'upsert'"),
+            _Resp(200),
+        ],
+        "unload_lora_adapter": _Resp(200),
     })
     _patch_httpx(monkeypatch, c)
-    with pytest.raises(RuntimeError, match="upsert"):
-        _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/miles_lora_v2")
-    assert all(r != "unload_lora_adapter" for r, _ in c.calls), (
-        "unload would block until in-flight requests finish, which never happens "
-        "while the engine is paused in retract mode"
-    )
+    _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/miles_lora_v2")
+
+    assert [r for r, _ in c.calls] == [
+        "load_lora_adapter", "unload_lora_adapter", "load_lora_adapter"
+    ]
+    assert c.calls[-1][1]["lora_path"] == "/d/miles_lora_v2", "the NEW version must be loaded"
+    assert "upsert" not in c.calls[-1][1], "the retry must not resend the field the server rejected"
 
 
-def test_a_server_without_the_upsert_field_is_reported_clearly(tmp_path, monkeypatch):
-    # LoadLoRAAdapterReqInput is a dataclass, so a stock server 422s an unknown field.
-    c = _FakeClient({"load_lora_adapter": _Resp(422, "unexpected keyword argument 'upsert'")})
+def test_an_older_server_reporting_a_name_conflict_also_falls_back(tmp_path, monkeypatch):
+    c = _FakeClient({
+        "load_lora_adapter": [
+            _Resp(400, "LoRA with name miles_lora already exists. Loaded LoRAs: ..."),
+            _Resp(200),
+        ],
+        "unload_lora_adapter": _Resp(200),
+    })
     _patch_httpx(monkeypatch, c)
-    with pytest.raises(RuntimeError, match="upsert"):
+    _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/v2")
+    assert [r for r, _ in c.calls].count("unload_lora_adapter") == 1
+
+
+def test_a_failed_unload_is_an_error(tmp_path, monkeypatch):
+    c = _FakeClient({
+        "load_lora_adapter": [_Resp(400, "already exists")],
+        "unload_lora_adapter": _Resp(500, "boom"),
+    })
+    _patch_httpx(monkeypatch, c)
+    with pytest.raises(RuntimeError, match="unload failed"):
         _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/v2")
 
 
-def test_an_unrelated_failure_is_not_blamed_on_upsert(tmp_path, monkeypatch):
+def test_an_unrelated_failure_never_triggers_an_unload(tmp_path, monkeypatch):
     c = _FakeClient({"load_lora_adapter": _Resp(500, "rank 64 exceeds --max-lora-rank")})
     _patch_httpx(monkeypatch, c)
     with pytest.raises(RuntimeError, match="load failed"):
         _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/v1")
+    assert all(r != "unload_lora_adapter" for r, _ in c.calls)
+
+
+def test_finalize_never_pauses_the_engines(tmp_path):
+    """Pausing would deadlock the unload fallback, so it must not appear here."""
+    import inspect
+
+    src = inspect.getsource(UpdateWeightHttpLora.finalize)
+    assert "pause_engines" not in src and "resume_engines" not in src
 
 
 @pytest.mark.parametrize("body", [

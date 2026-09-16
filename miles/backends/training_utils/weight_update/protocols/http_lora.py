@@ -45,11 +45,7 @@ from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
-from miles.backends.training_utils.weight_update.session import (
-    pause_engines,
-    resume_engines,
-    set_weight_version,
-)
+from miles.backends.training_utils.weight_update.session import set_weight_version
 
 logger = logging.getLogger(__name__)
 
@@ -142,49 +138,49 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
             by_adapter.setdefault(lora_name, {})[hf_key] = tensor
         self._buf.clear()
 
-        # The engines keep serving while the adapter is swapped unless we stop
-        # them. The updater's session frame normally does this; this protocol
-        # opts out of that frame, so it owns the pause itself.
+        # NOT paused on purpose. Pausing is what makes the stock-server fallback
+        # in _load_one deadlock: unload waits for in-flight requests to finish and
+        # a paused engine (retract/in_place, and --fully-async forbids abort) never
+        # finishes them. A path-based load is one operation the engine performs
+        # itself, so unlike the session frame's raw tensor stream there is no
+        # half-written state here to protect.
         engines = list(self.rollout_engines or [])
-        pause_engines(self.args, engines)
-        try:
-            for lora_name, tensors in by_adapter.items():
-                t0 = time.time()
-                local_dir = self._write_adapter(lora_name, weight_version, tensors)
-                nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
-                t_write = time.time() - t0
+        for lora_name, tensors in by_adapter.items():
+            t0 = time.time()
+            local_dir = self._write_adapter(lora_name, weight_version, tensors)
+            nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
+            t_write = time.time() - t0
 
-                t0 = time.time()
-                # Same escape hatch disk-delta uses: when the staging dir is not
-                # genuinely shared with the engine hosts, the operator supplies
-                # --custom-update-weight-post-write-path to replicate it.
-                if self._post_write_hook is not None:
-                    self._post_write_hook(self.args, local_dir, engines)
-                t_ship = time.time() - t0
+            t0 = time.time()
+            # Same escape hatch disk-delta uses: when the staging dir is not
+            # genuinely shared with the engine hosts, the operator supplies
+            # --custom-update-weight-post-write-path to replicate it.
+            if self._post_write_hook is not None:
+                self._post_write_hook(self.args, local_dir, engines)
+            t_ship = time.time() - t0
 
-                t0 = time.time()
-                self._load_everywhere(lora_name, local_dir)
-                t_load = time.time() - t0
+            t0 = time.time()
+            self._load_everywhere(lora_name, local_dir)
+            t_load = time.time() - t0
 
-                self._prune_old_versions(lora_name, weight_version)
+            self._prune_old_versions(lora_name, weight_version)
 
-                # Namespaced per adapter: a shared key set would leave only the
-                # last adapter's numbers on the step log.
-                self.update_weight_metrics.update({
-                    f"http_lora/{lora_name}/bytes": float(nbytes),
-                    f"http_lora/{lora_name}/write_s": t_write,
-                    f"http_lora/{lora_name}/ship_s": t_ship,
-                    f"http_lora/{lora_name}/load_s": t_load,
-                })
-                logger.info(
-                    "http-lora: %s v%d  %.0f MB  write %.1fs  ship %.1fs  load %.1fs  -> %d engine(s)",
-                    lora_name, weight_version, nbytes / 1e6, t_write, t_ship, t_load, len(engines),
-                )
-            # Without this the engines report a stale version forever and any
-            # staleness / off-policy-lag accounting downstream is wrong.
-            set_weight_version(engines, weight_version)
-        finally:
-            resume_engines(engines)
+            # Namespaced per adapter: a shared key set would leave only the last
+            # adapter's numbers on the step log.
+            self.update_weight_metrics.update({
+                f"http_lora/{lora_name}/bytes": float(nbytes),
+                f"http_lora/{lora_name}/write_s": t_write,
+                f"http_lora/{lora_name}/ship_s": t_ship,
+                f"http_lora/{lora_name}/load_s": t_load,
+            })
+            logger.info(
+                "http-lora: %s v%d  %.0f MB  write %.1fs  ship %.1fs  load %.1fs  -> %d engine(s)",
+                lora_name, weight_version, nbytes / 1e6, t_write, t_ship, t_load, len(engines),
+            )
+
+        # Without this the engines report a stale version forever and any staleness
+        # or off-policy-lag accounting downstream reads the wrong number.
+        set_weight_version(engines, weight_version)
 
     # ---------------------------------------------------------------- helpers
 
@@ -259,51 +255,63 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
         body = (resp.text or "").lower()
         return "already exists" in body or "already loaded" in body
 
+    @staticmethod
+    def _rejected_upsert(resp) -> bool:
+        """The engine does not know the ``upsert`` field.
+
+        ``LoadLoRAAdapterReqInput`` is a dataclass, so a server without the field
+        fails request validation (422) rather than ignoring it.
+        """
+        return resp.status_code == 422 and "upsert" in (resp.text or "").lower()
+
     def _load_one(self, base: str, lora_name: str, remote_dir: str) -> None:
-        """Install one version on one engine, replacing any previous one IN PLACE.
+        """Install one version on one engine, replacing whatever is there.
 
-        ``upsert`` is load-bearing, not a nicety. The updater hands a transport a
-        STABLE adapter name every sync (``LORA_ADAPTER_NAME``, or
-        ``slot_lora_name(slot)``), so every sync after the first names an adapter
-        the engine already holds, and a plain load is rejected with
-        "LoRA with name X already exists".
+        The updater hands a transport a STABLE adapter name every sync
+        (``LORA_ADAPTER_NAME``, or ``slot_lora_name(slot)``), so every sync after
+        the first names an adapter the engine already holds and a plain load is
+        rejected with "LoRA with name X already exists". Treating that as success
+        is how a run silently keeps serving the step-1 adapter forever.
 
-        Unload-then-load is NOT a usable fallback. ``unload_lora_adapter``
-        unregisters the name and then waits for the adapter's usage counter to
-        reach zero (``LoRARegistry.wait_for_unload``), and that counter is held
-        from request admission until the request *finishes*. Under
-        ``--pause-generation-mode=retract`` (the default) a paused engine has
-        moved in-flight requests back to the waiting queue rather than finishing
-        them, so the counter never drains and the unload blocks until this
-        timeout fires. ``in_place`` has the same problem, and ``abort`` -- the one
-        mode where it would work -- is rejected outright by ``--fully-async``.
+        Preferred: ``upsert`` replaces the weights behind the name in place, with
+        no unload and no window where the name is missing. It is what
+        ``load_lora_adapter_from_tensors`` and ``..._from_distributed`` already
+        take in this client.
 
-        So: upsert, or fail with something the operator can act on.
+        Fallback for a server without it: unload, then load. This is only safe
+        because nothing is paused -- ``unload_lora_adapter`` waits for the
+        adapter's usage counter to reach zero, and that counter is released only
+        when a request FINISHES, which a paused engine never lets happen under
+        ``--pause-generation-mode=retract`` or ``in_place`` (and ``--fully-async``
+        rejects ``abort``). It leaves a brief window where the name is absent;
+        requests arriving in it fail and are retried by the rollout layer. Under
+        synchronous RL the window is empty because generation has already drained.
         """
         import httpx
 
-        payload = {
-            "lora_name": lora_name,
-            "lora_path": remote_dir,
-            "pinned": False,
-            # Replace the weights behind this name without unload/register, which
-            # also keeps the adapter id stable for requests already admitted.
-            "upsert": True,
-        }
+        base_payload = {"lora_name": lora_name, "lora_path": remote_dir, "pinned": False}
         with httpx.Client(timeout=self._load_timeout_s) as client:
-            r = client.post(base + "/load_lora_adapter", json=payload)
+            r = client.post(base + "/load_lora_adapter", json={**base_payload, "upsert": True})
             if r.status_code == 200:
                 return
-            if r.status_code == 422 or self._is_name_conflict(r):
+            if not (self._rejected_upsert(r) or self._is_name_conflict(r)):
+                raise RuntimeError(f"http-lora: load failed on {base}: HTTP {r.status_code} {r.text[:200]}")
+
+            logger.warning(
+                "http-lora: %s does not support upsert on /load_lora_adapter; falling back to "
+                "unload+load, which briefly leaves %r unregistered", base, lora_name,
+            )
+            u = client.post(base + "/unload_lora_adapter", json={"lora_name": lora_name})
+            if u.status_code != 200 and not self._is_name_conflict(u):
                 raise RuntimeError(
-                    f"http-lora: {base} would not replace adapter {lora_name!r} in place "
-                    f"(HTTP {r.status_code}: {r.text[:160]}). This transport re-publishes the "
-                    "same adapter name every sync, so the engine must support `upsert` on "
-                    "/load_lora_adapter. Unload-then-load is not a safe fallback: unload waits "
-                    "for in-flight requests to finish, which a paused engine never lets happen "
-                    "under the default --pause-generation-mode=retract."
+                    f"http-lora: {lora_name!r} is registered on {base} and unload failed: "
+                    f"HTTP {u.status_code} {u.text[:200]}"
                 )
-            raise RuntimeError(f"http-lora: load failed on {base}: HTTP {r.status_code} {r.text[:200]}")
+            r = client.post(base + "/load_lora_adapter", json=base_payload)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"http-lora: reload after unload failed on {base}: HTTP {r.status_code} {r.text[:200]}"
+                )
 
     def _load_everywhere(self, lora_name: str, remote_dir: str) -> None:
         """Install the staged adapter on every engine, in parallel.
