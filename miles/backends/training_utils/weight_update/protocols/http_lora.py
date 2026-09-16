@@ -53,6 +53,13 @@ from miles.backends.training_utils.weight_update.session import (
 
 logger = logging.getLogger(__name__)
 
+# Versioned staging dirs are written every sync; keep a few so an engine can still
+# be reading the previous one, and no more.
+KEEP_VERSIONS = 3
+# A load is a file read on the engine host. 1800s meant one wedged engine stalled
+# training for half an hour before anyone noticed.
+LOAD_TIMEOUT_S = 300.0
+
 
 class UpdateWeightHttpLora(WeightTransferProtocol):
     """Stage the adapter to a directory, then POST its path to every engine."""
@@ -81,10 +88,8 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
             "available to a weight-transfer protocol, so adapters would be published "
             "with the global --lora-rank/--lora-alpha."
         )
-        self._keep_versions: int = int(getattr(args, "http_lora_keep_versions", 3) or 0)
-        # 1800s per engine meant a single wedged engine stalled training for half
-        # an hour before anyone saw it. A load is a file read on the engine host.
-        self._load_timeout_s: float = float(getattr(args, "http_lora_load_timeout", 300.0))
+        self._keep_versions: int = KEEP_VERSIONS
+        self._load_timeout_s: float = LOAD_TIMEOUT_S
         self._post_write_hook: Callable | None = None
         if getattr(args, "custom_update_weight_post_write_path", None):
             from miles.utils.function_registry import load_function
@@ -250,43 +255,55 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
 
     @staticmethod
     def _is_name_conflict(resp) -> bool:
-        """The engine already holds this adapter name.
-
-        SGLang's registry raises ``LoRA with name X already exists`` on a second
-        registration (lora_registry.py). The updater hands us a STABLE name every
-        sync (``LORA_ADAPTER_NAME``, or ``slot_lora_name(slot)``), so every sync
-        after the first collides. This is the ONLY place that string is accepted,
-        and it triggers a replace -- never a success. Treating it as success is
-        how a run silently keeps serving the step-1 adapter while training moves on.
-        """
+        """The engine already holds this adapter name and did not replace it."""
         body = (resp.text or "").lower()
         return "already exists" in body or "already loaded" in body
 
     def _load_one(self, base: str, lora_name: str, remote_dir: str) -> None:
+        """Install one version on one engine, replacing any previous one IN PLACE.
+
+        ``upsert`` is load-bearing, not a nicety. The updater hands a transport a
+        STABLE adapter name every sync (``LORA_ADAPTER_NAME``, or
+        ``slot_lora_name(slot)``), so every sync after the first names an adapter
+        the engine already holds, and a plain load is rejected with
+        "LoRA with name X already exists".
+
+        Unload-then-load is NOT a usable fallback. ``unload_lora_adapter``
+        unregisters the name and then waits for the adapter's usage counter to
+        reach zero (``LoRARegistry.wait_for_unload``), and that counter is held
+        from request admission until the request *finishes*. Under
+        ``--pause-generation-mode=retract`` (the default) a paused engine has
+        moved in-flight requests back to the waiting queue rather than finishing
+        them, so the counter never drains and the unload blocks until this
+        timeout fires. ``in_place`` has the same problem, and ``abort`` -- the one
+        mode where it would work -- is rejected outright by ``--fully-async``.
+
+        So: upsert, or fail with something the operator can act on.
+        """
         import httpx
 
-        payload = {"lora_name": lora_name, "lora_path": remote_dir, "pinned": False}
+        payload = {
+            "lora_name": lora_name,
+            "lora_path": remote_dir,
+            "pinned": False,
+            # Replace the weights behind this name without unload/register, which
+            # also keeps the adapter id stable for requests already admitted.
+            "upsert": True,
+        }
         with httpx.Client(timeout=self._load_timeout_s) as client:
             r = client.post(base + "/load_lora_adapter", json=payload)
             if r.status_code == 200:
                 return
-            if not self._is_name_conflict(r):
-                raise RuntimeError(f"http-lora: load failed on {base}: HTTP {r.status_code} {r.text[:200]}")
-
-            # Replace in place. This build's LoadLoRAAdapterReqInput has no
-            # `upsert` field, so unload-then-load is the portable path; both
-            # routes exist on a stock server.
-            u = client.post(base + "/unload_lora_adapter", json={"lora_name": lora_name})
-            if u.status_code != 200:
+            if r.status_code == 422 or self._is_name_conflict(r):
                 raise RuntimeError(
-                    f"http-lora: {lora_name} already registered on {base} and unload failed: "
-                    f"HTTP {u.status_code} {u.text[:200]}"
+                    f"http-lora: {base} would not replace adapter {lora_name!r} in place "
+                    f"(HTTP {r.status_code}: {r.text[:160]}). This transport re-publishes the "
+                    "same adapter name every sync, so the engine must support `upsert` on "
+                    "/load_lora_adapter. Unload-then-load is not a safe fallback: unload waits "
+                    "for in-flight requests to finish, which a paused engine never lets happen "
+                    "under the default --pause-generation-mode=retract."
                 )
-            r = client.post(base + "/load_lora_adapter", json=payload)
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"http-lora: reload after unload failed on {base}: HTTP {r.status_code} {r.text[:200]}"
-                )
+            raise RuntimeError(f"http-lora: load failed on {base}: HTTP {r.status_code} {r.text[:200]}")
 
     def _load_everywhere(self, lora_name: str, remote_dir: str) -> None:
         """Install the staged adapter on every engine, in parallel.

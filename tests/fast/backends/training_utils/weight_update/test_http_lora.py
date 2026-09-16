@@ -1,4 +1,4 @@
-"""The load path must REPLACE, not skip.
+"""The load path must REPLACE in place, and must never silently skip.
 
 The updater hands a transport a stable adapter name every sync
 (``LORA_ADAPTER_NAME``, or ``slot_lora_name(slot)`` under multi-LoRA), so every
@@ -61,47 +61,47 @@ def _patch_httpx(monkeypatch, client):
     monkeypatch.setattr(httpx, "Client", lambda **kw: client)
 
 
-def test_a_clean_load_does_not_unload(tmp_path, monkeypatch):
+def test_the_load_asks_the_engine_to_replace_in_place(tmp_path, monkeypatch):
     c = _FakeClient({"load_lora_adapter": _Resp(200)})
     _patch_httpx(monkeypatch, c)
     _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/miles_lora_v1")
-    assert [r for r, _ in c.calls] == ["load_lora_adapter"]
+
+    routes = [r for r, _ in c.calls]
+    assert routes == ["load_lora_adapter"]
+    assert c.calls[0][1]["upsert"] is True, (
+        "the adapter name is stable across syncs, so the engine must replace the "
+        "weights behind it rather than reject a duplicate registration"
+    )
 
 
-def test_an_already_registered_name_is_replaced_not_skipped(tmp_path, monkeypatch):
-    """THE regression: sync 2+ must actually change the served adapter."""
+def test_an_engine_that_will_not_replace_fails_loudly(tmp_path, monkeypatch):
+    """THE regression. Never report success, and never fall back to unload:
+    unload waits on in-flight requests that a paused engine cannot finish."""
     c = _FakeClient({
-        "load_lora_adapter": [
-            _Resp(400, "LoRA with name miles_lora already exists. Loaded LoRAs: ..."),
-            _Resp(200),
-        ],
-        "unload_lora_adapter": _Resp(200),
+        "load_lora_adapter": _Resp(400, "LoRA with name miles_lora already exists. Loaded LoRAs: ..."),
     })
     _patch_httpx(monkeypatch, c)
-    _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/miles_lora_v2")
+    with pytest.raises(RuntimeError, match="upsert"):
+        _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/miles_lora_v2")
+    assert all(r != "unload_lora_adapter" for r, _ in c.calls), (
+        "unload would block until in-flight requests finish, which never happens "
+        "while the engine is paused in retract mode"
+    )
 
-    assert [r for r, _ in c.calls] == [
-        "load_lora_adapter", "unload_lora_adapter", "load_lora_adapter"
-    ], "a name collision must unload and reload, not be swallowed as success"
-    assert c.calls[-1][1]["lora_path"] == "/d/miles_lora_v2", "the NEW version must be the one loaded"
 
-
-def test_a_failed_unload_is_an_error(tmp_path, monkeypatch):
-    c = _FakeClient({
-        "load_lora_adapter": [_Resp(400, "already exists")],
-        "unload_lora_adapter": _Resp(500, "boom"),
-    })
+def test_a_server_without_the_upsert_field_is_reported_clearly(tmp_path, monkeypatch):
+    # LoadLoRAAdapterReqInput is a dataclass, so a stock server 422s an unknown field.
+    c = _FakeClient({"load_lora_adapter": _Resp(422, "unexpected keyword argument 'upsert'")})
     _patch_httpx(monkeypatch, c)
-    with pytest.raises(RuntimeError, match="unload failed"):
+    with pytest.raises(RuntimeError, match="upsert"):
         _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/v2")
 
 
-def test_an_unrelated_failure_never_triggers_an_unload(tmp_path, monkeypatch):
+def test_an_unrelated_failure_is_not_blamed_on_upsert(tmp_path, monkeypatch):
     c = _FakeClient({"load_lora_adapter": _Resp(500, "rank 64 exceeds --max-lora-rank")})
     _patch_httpx(monkeypatch, c)
     with pytest.raises(RuntimeError, match="load failed"):
         _protocol(tmp_path)._load_one("http://e:1", "miles_lora", "/d/v1")
-    assert all(r != "unload_lora_adapter" for r, _ in c.calls)
 
 
 @pytest.mark.parametrize("body", [
