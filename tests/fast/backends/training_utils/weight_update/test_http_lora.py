@@ -220,6 +220,30 @@ def test_the_engines_are_resumed_even_when_the_load_raises(tmp_path, monkeypatch
     assert events == ["pause", "resume"], "a failed swap must not leave the fleet paused"
 
 
+def test_the_engines_are_resumed_even_when_the_pause_itself_fails(tmp_path, monkeypatch):
+    """pause_engines pauses and then flushes; stock SGLang refuses the flush while
+    retracted requests are queued, so under --fully-async the helper can raise with
+    the fleet already paused. Seen live: a run died at sync 3 and the engine stayed
+    paused until someone called /continue_generation by hand."""
+    p = _protocol(tmp_path, supported=True)
+    events = []
+
+    def paused_then_flush_failed(args, engines):
+        events.append("pause")
+        raise TimeoutError("Timeout while flushing cache: Flush cache failed.")
+
+    monkeypatch.setattr(mod, "pause_engines", paused_then_flush_failed)
+    monkeypatch.setattr(mod, "resume_engines", lambda engines: events.append("resume"))
+    monkeypatch.setattr(mod, "set_weight_version", lambda engines, v: None)
+    monkeypatch.setattr(p, "_write_adapter", lambda name, v, t: str(p._stage_root))
+    monkeypatch.setattr(p, "_load_everywhere", lambda name, d: events.append("load"))
+    p.is_sender, p._post_write_hook, p.update_weight_metrics = True, None, {}
+    p._buf = {"miles_lora:k.lora_A.weight": torch.zeros(2, 2)}
+    with pytest.raises(TimeoutError):
+        p.finalize(1)
+    assert events == ["pause", "resume"], "a failed pause must not leave the fleet paused"
+
+
 # ------------------------------------------------------------------ the rest
 
 def test_rank_comes_from_the_tensors_not_the_flags(tmp_path):

@@ -156,10 +156,16 @@ class UpdateWeightHttpLora(WeightTransferProtocol):
         # engine under retract/in_place never finishes them.
         engines = list(self.rollout_engines or [])
         first_sync = self._upsert_supported is None
-        paused = first_sync or bool(self._upsert_supported)
-        if paused:
-            pause_engines(self.args, engines)
+        paused = False
         try:
+            if first_sync or bool(self._upsert_supported):
+                # Flag first, then pause: if the pause or its cache flush fails
+                # part-way (stock SGLang refuses to flush while retracted requests
+                # are queued), the fleet may already be paused on some engines and
+                # must still be resumed below. Nothing here can wait on in-flight
+                # requests, so pausing is safe in both branches.
+                paused = True
+                pause_engines(self.args, engines)
             for lora_name, tensors in by_adapter.items():
                 t0 = time.time()
                 local_dir = self._write_adapter(lora_name, weight_version, tensors)
