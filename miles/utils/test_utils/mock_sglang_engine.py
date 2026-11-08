@@ -8,7 +8,7 @@ from typing import Any
 
 import ray
 
-from miles.utils.misc import NodeProbeMixin, get_free_port
+from miles.utils.misc import NodeProbeMixin
 from miles.utils.test_utils.mock_sglang_http_server import MockSGLangHttpServer
 
 logger = logging.getLogger(__name__)
@@ -51,8 +51,8 @@ class MockSGLangEngine:
         else:
             self._faults[method] = exception
 
-    def inject_fault(self, mode: str) -> None:
-        self._record("inject_fault", (), {"mode": mode})
+    def control_fault_hook(self, command: object) -> None:
+        self._record("control_fault_hook", (), {"command": command})
 
     def get_calls(self) -> list[tuple[str, tuple, dict]]:
         return list(self.calls)
@@ -87,13 +87,17 @@ class MockSGLangEngine:
         if self._http_server is not None:
             self._http_server.close()
 
-    def _get_free_port_block(self, *, start_port: int, count: int) -> int:
+    def _get_free_port_block(self, *, start_port: int | None, count: int) -> int:
         self._record("_get_free_port_block", (), {"start_port": start_port, "count": count})
-        return get_free_port(start_port=start_port, consecutive=count)
+        return NodeProbeMixin._get_free_port_block(start_port=start_port, count=count)
 
     def _get_node_ip(self):
         self._record("_get_node_ip", (), {})
         return NodeProbeMixin._get_node_ip()
+
+    def _get_node_external_ip(self):
+        self._record("_get_node_external_ip", (), {})
+        return NodeProbeMixin._get_node_external_ip()
 
     def _to_local_gpu_ids(self, *, gpu_ids: list[int]) -> list[int]:
         self._record("_to_local_gpu_ids", (), {"gpu_ids": gpu_ids})
@@ -106,9 +110,6 @@ class MockSGLangEngine:
     def _get_gpu_uuids(self, gpu_ids: list[int]):
         self._record("_get_gpu_uuids", (gpu_ids,), {})
         return [None] * len(gpu_ids)
-
-    def _collect_env_report(self, *, role: str, rank: int, partial_env_report: str):
-        self._record("_collect_env_report", (), {"role": role, "rank": rank, "partial_env_report": partial_env_report})
 
     def _record(self, name: str, args: tuple, kwargs: dict) -> None:
         self.calls.append((name, args, kwargs))

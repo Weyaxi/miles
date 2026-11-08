@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from argparse import Namespace
 from pathlib import Path
 
 import pytest
-from tests.fast.ray.rollout.conftest import make_args, make_sglang_config_yaml
+from tests.fast.fixtures.args_fixtures import parse_megatron_test_config
+from tests.fast.ray.rollout.conftest import make_sglang_config_yaml
 from tests.fast.utils.workers.fake_ray import FakeRayCluster, FakeRayModule
 
 from miles.ray.placement_group import PlacementGroupInfo
-from miles.ray.specs.inference import specs_inference_engine
+from miles.ray.specs.inference import InferenceEngineSpec
+from miles.utils.args.runtime import AllConfig
 from miles.utils.workers.naming import compute_worker_name
 from miles.utils.workers.ray_worker_manager import RayWorkerManager
-from miles.utils.workers.worker_spec import CommandWorkerSpec, LaunchCommandContext, NamedHostAndPorts
+from miles.utils.workers.types import WorkerCommBackend
+from miles.utils.workers.worker_spec import LaunchCommandContext, NamedHostAndPorts
 
 
 @pytest.fixture
@@ -25,7 +27,7 @@ def fake_ray_cluster(monkeypatch: pytest.MonkeyPatch) -> FakeRayCluster:
     return cluster
 
 
-def _make_args(*, tmp_path: Path, worker_types: list[str], num_gpus: int, num_gpus_per_engine: int) -> Namespace:
+def _make_args(*, tmp_path: Path, worker_types: list[str], num_gpus: int, num_gpus_per_engine: int) -> AllConfig:
     config_path = tmp_path / "sglang.yaml"
     config_path.write_text(
         make_sglang_config_yaml(
@@ -35,35 +37,38 @@ def _make_args(*, tmp_path: Path, worker_types: list[str], num_gpus: int, num_gp
             ]
         )
     )
-    return make_args(
-        sglang_config=str(config_path),
-        rollout_num_gpus=num_gpus * len(worker_types),
-        use_session_server=False,
+    return parse_megatron_test_config(
+        "--sglang-config", str(config_path), "--rollout-num-gpus", str(num_gpus * len(worker_types))
     )
 
 
-async def _launch_engines(args: Namespace) -> dict[str, LaunchCommandContext]:
+async def _launch_engines(args: AllConfig) -> dict[str, LaunchCommandContext]:
     """Run the real launch pipeline and return, per worker name, the context its launch command got."""
     contexts: dict[str, LaunchCommandContext] = {}
 
-    def _recording_spec(spec: CommandWorkerSpec) -> CommandWorkerSpec:
-        def _record(ctx: LaunchCommandContext) -> str:
+    class _RecordingEngineSpec(InferenceEngineSpec):
+        def launch_command(self, ctx: LaunchCommandContext) -> str:
             worker_name = compute_worker_name(
-                pool_id=spec.name, cell_index=ctx.cell_index, worker_in_cell_index=ctx.worker_in_cell_index
+                pool_id=self.name, cell_index=ctx.cell_index, worker_in_cell_index=ctx.worker_in_cell_index
             )
             contexts[worker_name] = ctx
             return f"launch {worker_name}"
 
-        return spec.model_copy(update={"launch_command": _record})
-
-    specs = [_recording_spec(spec) for spec in specs_inference_engine(args)]
+    specs = [
+        _RecordingEngineSpec(**{name: getattr(spec, name) for name in InferenceEngineSpec.model_fields})
+        for config in InferenceEngineSpec.slice_configs(args)
+        for spec in InferenceEngineSpec.create(config)
+    ]
     num_slots = sum(
-        spec.scheduling.num_cells * spec.scheduling.num_workers_per_cell * spec.scheduling.num_gpu_slots_per_worker
+        (scheduling := spec.scheduling(args)).num_cells
+        * scheduling.num_workers_per_cell
+        * scheduling.num_gpu_slots_per_worker
         for spec in specs
     )
 
     manager = RayWorkerManager()
     await manager.init(
+        args,
         specs,
         {
             "rollout": PlacementGroupInfo(
@@ -72,6 +77,7 @@ async def _launch_engines(args: Namespace) -> dict[str, LaunchCommandContext]:
                 pg_reordered_gpu_ids=list(range(max(num_slots, 1))),
             )
         },
+        comm_backend=WorkerCommBackend.RAY,
     )
 
     return contexts
@@ -94,7 +100,9 @@ class TestAddressingOfLaunchedEngines:
 
         contexts = await _launch_engines(args)
 
-        assert sorted(contexts) == [f"inference-engine-0-0-{cell_index}-0" for cell_index in range(8)]
+        assert sorted(contexts) == [
+            compute_worker_name(pool_id="inference-engine-all-0-0", cell_index=cell_index) for cell_index in range(8)
+        ]
         issued: list[int] = []
         for ctx in contexts.values():
             addrs = ctx.self_addrs
@@ -112,7 +120,7 @@ class TestAddressingOfLaunchedEngines:
 
         contexts = await _launch_engines(args)
 
-        prefill = contexts["inference-engine-0-0-0-0"].self_addrs
+        prefill = contexts[compute_worker_name(pool_id="inference-engine-all-0-0")].self_addrs
         assert "disaggregation_bootstrap" in prefill
         ports = _all_ports(prefill)
         assert len(set(ports)) == len(ports)

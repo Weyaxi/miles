@@ -57,6 +57,7 @@
        "user-guide/launch-script",
        "user-guide/argument-groups",
        "user-guide/fully-async",
+       "user-guide/mixing-datasets",
        "user-guide/training-backend",
        "user-guide/monitoring",
        "user-guide/customization",
@@ -163,6 +164,7 @@
         "pages": [
          "models/glm/index",
          "models/glm/glm5-3-flash",
+         "models/glm/glm5-3",
          "models/glm/glm5-2",
          "models/glm/glm5",
          "models/glm/glm4-7-flash",
@@ -175,6 +177,7 @@
         "pages": [
          "models/kimi/index",
          "models/kimi/kimi-k3",
+         "models/kimi/kimi-k31",
          "models/kimi/kimi-k2.5",
          "models/kimi/kimi-k2"
         ],
@@ -205,7 +208,13 @@
         ],
         "expanded": false
        },
-       "models/gpt-oss/gpt-oss"
+       "models/gpt-oss/gpt-oss",
+       "models/mimo/mimo-v2-6-flash",
+       "models/minimax/minimax-m3",
+       "models/minimax/minimax-m3-1-flash",
+       "models/stepfun/step5",
+       "models/muse-spark/muse-spark-open",
+       "models/reflection/beam"
       ]
      }
     ]
@@ -222,6 +231,7 @@
        "advanced/speculative-decoding",
        "advanced/sampling-support-replay",
        "advanced/lora",
+       "advanced/multi-lora",
        "advanced/on-policy-distillation"
       ]
      },
@@ -241,6 +251,20 @@
       "pages": [
        "advanced/miles-router"
       ]
+     },
+     {
+      "group": "Cluster & Deployment",
+      "pages": [
+       "advanced/cluster-backend"
+      ]
+     },
+     {
+      "group": "Algorithm",
+      "pages": [
+       "examples/infra-features/score-centering",
+       "examples/infra-features/train-infer-mismatch-helper",
+       "advanced/algorithms/length-penalties"
+      ]
      }
     ]
    },
@@ -254,11 +278,15 @@
        "examples/geo3k-vlm",
        "examples/geo3k-vlm/multi-turn",
        "examples/multi-lora",
+       "examples/multi-lora/harbor-tinker",
+       "examples/multi-lora/tinker-agent",
+       "examples/multi-policy",
        "examples/on-policy-distillation",
        "examples/on-policy-distillation/qwen3-5-35b-selfdistill",
        "examples/ppo",
        "examples/retool-v2",
-       "examples/swe-agent-harbor-docker"
+       "examples/swe-agent-harbor-docker",
+       "examples/text-to-sql"
       ]
      },
      {
@@ -266,9 +294,12 @@
       "pages": [
        "examples/infra-features",
        "examples/infra-features/fully-async",
+       "examples/infra-features/hot-restart",
        "examples/infra-features/low-precision",
        "examples/infra-features/p2p-weight-transfer",
        "examples/infra-features/random-async",
+       "examples/infra-features/score-centering",
+       "examples/infra-features/split-deployment",
        "examples/infra-features/train-infer-mismatch-helper",
        "examples/infra-features/true-on-policy"
       ]
@@ -282,15 +313,16 @@
      "developer/contributor-guide",
      "developer/architecture",
      "developer/adding-a-sandbox-provider",
+     "developer/reconcile-loop",
      "developer/versions",
      "developer/debug",
      {
       "group": "CI",
       "pages": [
-       "ci/contributor-guide",
        "ci/00-stage",
        "ci/01-label",
        "ci/02-docker-build",
+       "developer/ci/06-build-wheels",
        "ci/03-metric-history-gate",
        "ci/04-release",
        "ci/05-command-identity"
@@ -302,6 +334,7 @@
     "tab": "Diffusion",
     "pages": [
      "diffusion/index",
+     "diffusion/fsdp_model_roles",
      {
       "group": "Getting Started",
       "pages": [
@@ -324,9 +357,25 @@
       "group": "Models",
       "pages": [
        "diffusion/models/cosmos/cosmos3",
-       "diffusion/models/h3/h3",
+       "diffusion/models/flux3/flux3-image",
+       {
+        "group": "h3",
+        "pages": [
+         "diffusion/models/h3/h3",
+         "diffusion/models/h3/lora_sft_guide"
+        ],
+        "expanded": false
+       },
+       "diffusion/models/krea/krea2",
        "diffusion/models/ltx/ltx2",
-       "diffusion/models/qwen-image/qwen-image",
+       {
+        "group": "qwen-image",
+        "pages": [
+         "diffusion/models/qwen-image/qwen-image-21",
+         "diffusion/models/qwen-image/qwen-image"
+        ],
+        "expanded": false
+       },
        "diffusion/models/sd3/sd3",
        "diffusion/models/wan/wan2-2"
       ]
@@ -416,6 +465,11 @@
   {
    "source": "/user-guide/dashboard",
    "destination": "/user-guide/monitoring",
+   "permanent": true
+  },
+  {
+   "source": "/developer/ci/contributor-guide",
+   "destination": "/developer/contributor-guide#registering-a-test",
    "permanent": true
   }
  ],

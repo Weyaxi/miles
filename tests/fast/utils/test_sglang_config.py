@@ -2,7 +2,7 @@
 
 from tests.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=60, suite="stage-a-cpu", labels=[])
+register_cpu_ci(est_time=60, suite="stage-b-cpu", labels=["sglang"])
 
 import pytest
 import yaml
@@ -17,7 +17,7 @@ def _write_yaml(data: dict, tmp_path) -> str:
 def _resolve(path: str, *, rollout_num_gpus: int, hf_checkpoint: str = "/path/to/model"):
     from argparse import Namespace
 
-    from miles.backends.sglang_utils.sglang_config import resolve_sglang_config
+    from tests.fast.fixtures.sglang_config_fixtures import resolve_sglang_config_and_scaling
 
     args = Namespace(
         sglang_config=path,
@@ -37,9 +37,9 @@ def _resolve(path: str, *, rollout_num_gpus: int, hf_checkpoint: str = "/path/to
         critic_num_nodes=0,
         critic_num_gpus_per_node=0,
         use_critic=False,
-        critic_train_only=False,
+        multi_lora=False,
     )
-    return resolve_sglang_config(args)
+    return resolve_sglang_config_and_scaling(args)
 
 
 class TestSglangConfigUpdateWeights:
@@ -63,7 +63,7 @@ class TestSglangConfigUpdateWeights:
             },
             tmp_path,
         )
-        config = _resolve(path, rollout_num_gpus=6)
+        config, _ = _resolve(path, rollout_num_gpus=6)
         assert len(config.models) == 2
         assert config.models[0].name == "actor"
         assert config.models[0].update_weights is True
@@ -89,8 +89,8 @@ class TestSglangConfigUpdateWeights:
             },
             tmp_path,
         )
-        config = _resolve(path, rollout_num_gpus=12)
-        assert sum(g.num_gpus for m in config.models for g in m.server_groups) == 12
+        config, scaling = _resolve(path, rollout_num_gpus=12)
+        assert sum(g.num_gpus for groups in scaling.groups.values() for g in groups) == 12
 
 
 class TestGetModelUrl:
@@ -126,7 +126,7 @@ class TestGetModelUrl:
         assert get_model_url(args, "unknown") == "http://10.0.0.1:3000/generate"
 
     def test_get_model_url_no_routers(self):
-        """get_model_url should work when sglang_model_routers is not set."""
+        """get_model_url should work when sglang_model_routers is left at its parser default."""
         from argparse import Namespace
 
         from miles.rollout.sglang_rollout import get_model_url
@@ -134,6 +134,7 @@ class TestGetModelUrl:
         args = Namespace(
             sglang_router_ip="10.0.0.1",
             sglang_router_port=3000,
+            sglang_model_routers=None,
         )
         assert get_model_url(args, "anything") == "http://10.0.0.1:3000/generate"
 

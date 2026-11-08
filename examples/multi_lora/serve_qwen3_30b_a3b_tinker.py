@@ -48,8 +48,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
 @U.dataclass_cli
 def prepare(args: ScriptArgs):
     """Download the Qwen3-30B-A3B checkpoint. Run once per node before serving."""
-    U.exec_command_cpu(f"mkdir -p {args.model_dir}")
-    U.exec_command_cpu(f"hf download Qwen/Qwen3-30B-A3B --local-dir {args.model_dir}/Qwen3-30B-A3B")
+    backend = args.create_backend()
+    backend.exec_command_cpu(f"mkdir -p {args.model_dir}")
+    backend.exec_command_cpu(f"hf download Qwen/Qwen3-30B-A3B --local-dir {args.model_dir}/Qwen3-30B-A3B")
 
 
 @app.command()
@@ -80,6 +81,8 @@ def serve(args: ScriptArgs):
         "--pipeline-model-parallel-size 1 --context-parallel-size 1 "
         f"--expert-model-parallel-size {args.ep} --expert-tensor-parallel-size 1 "
         "--use-dynamic-batch-size --max-tokens-per-gpu 8192 "
+        # Tinker targets cover full sequences; bound the FP32 cross-entropy temporaries
+        "--log-probs-chunk-size 1024 "
     )
 
     sglang_args = (
@@ -103,9 +106,8 @@ def serve(args: ScriptArgs):
         f"{perf_args} {sglang_args} {topology_args} {misc_args} {args.extra_args} "
     )
 
-    U.execute_train(
+    args.create_backend().execute_train(
         train_args=train_args,
-        config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type=args.model_type,
         train_script="serve_tinker.py",

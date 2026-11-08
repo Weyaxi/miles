@@ -4,7 +4,9 @@ import os
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding as _vocab_size_with_padding
 from megatron.training.arguments import parse_args, validate_args
 
+from miles.utils.hf_utils.config import load_hf_config
 from miles_plugins.models.deepseek_v4.arguments import is_dsv4_model, normalize_dsv4_args
+from miles_plugins.models.glm5.arguments import normalize_dsa_args
 
 __all__ = ["validate_args", "parse_args", "set_default_megatron_args"]
 
@@ -12,18 +14,18 @@ logger = logging.getLogger(__name__)
 
 
 def set_default_megatron_args(args):
-    if getattr(args, "true_on_policy_mode", False):
+    if args.true_on_policy_mode:
         raise NotImplementedError(
             "--true-on-policy-mode is not supported on the megatron backend with this Megatron "
             "version; support lands in a follow-up PR. Use --train-backend fsdp for true-on-policy."
         )
     # Muon currently owns its sharding path, and Megatron's distributed optimizer
     # only supports Adam-family optimizers.
-    args.use_distributed_optimizer = (args.optimizer is None or args.optimizer.lower() == "adam") and not getattr(
-        args, "debug_disable_optimizer", False
-    )
+    args.use_distributed_optimizer = (
+        args.optimizer is None or args.optimizer.lower() == "adam"
+    ) and not args.debug_disable_optimizer
     # Multi-LoRA: per-slot LayerWise optimizers require plain DDP all-reduce.
-    if getattr(args, "multi_lora_n_adapters", 0) > 0:
+    if args.multi_lora_n_adapters > 0:
         args.use_distributed_optimizer = False
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
@@ -39,7 +41,7 @@ def set_default_megatron_args(args):
     # the TE one increase log prob diff so manually set back
     args.moe_router_use_torch_mm = True
     # compatible for megatron
-    if hasattr(args, "rope_type") and args.rope_type is None:
+    if args.rope_type is None:
         args.rope_type = "yarn" if args.multi_latent_attention else "rope"
 
     if args.vocab_size and not args.padded_vocab_size:
@@ -52,10 +54,12 @@ def set_default_megatron_args(args):
 
     args.trust_remote_code = True
 
-    if not hasattr(args, "miles_dsa_topk_backend"):
-        args.miles_dsa_topk_backend = "torch"
-
     if is_dsv4_model(args):
         normalize_dsv4_args(args)
+
+    if args.dsa_impl == "megatron":
+        normalize_dsa_args(args, load_hf_config(args.hf_checkpoint))
+    elif args.cp_comm_type is None:
+        args.cp_comm_type = ["p2p"]
 
     return args

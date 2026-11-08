@@ -7,9 +7,14 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 _ASYNC_METHOD_NODE_IP = "_get_node_ip"
+_ASYNC_METHOD_NODE_EXTERNAL_IP = "_get_node_external_ip"
 _ASYNC_METHOD_FREE_PORT_BLOCK = "_get_free_port_block"
 _ASYNC_METHOD_IS_PORT_AVAILABLE = "_is_port_available"
 _ASYNC_METHOD_TO_LOCAL_GPU_IDS = "_to_local_gpu_ids"
+
+READINESS_METHOD = "__ray_ready__"
+
+_SERVICE_PORT_START = 20000
 
 EVENT_CREATE = "create"
 EVENT_KILL = "kill"
@@ -69,6 +74,10 @@ class FakeRayActorHandle:
             raise AttributeError(name)
         return FakeRayActorMethod(handle=self, method=name)
 
+    @property
+    def __ray_ready__(self) -> FakeRayActorMethod:
+        return FakeRayActorMethod(handle=self, method=READINESS_METHOD)
+
 
 @dataclass(kw_only=True)
 class FakeRayRemoteClass:
@@ -98,12 +107,13 @@ class FakeRayModule:
             return FakeRayRemoteClass(cluster=self.cluster, actor_class=actor_class)
         return lambda cls: FakeRayRemoteClass(cluster=self.cluster, actor_class=cls, actor_options=decorator_options)
 
-    def method(self, *, concurrency_group: str):
-        def annotate(func: Any) -> Any:
-            func.__ray_concurrency_group__ = concurrency_group
-            return func
+    def method(self, **decorator_options: Any):
+        def _decorator(fn: Any) -> Any:
+            for name, value in decorator_options.items():
+                setattr(fn, f"__ray_{name}__", value)
+            return fn
 
-        return annotate
+        return _decorator
 
     def get(self, ref: FakeRayObjectRef, timeout: float | None = None) -> Any:
         self.cluster.resolved_refs.append(ref.method)
@@ -122,6 +132,9 @@ class FakeRayModule:
 @dataclass
 class FakeRayCluster:
     node_ips: tuple[str, ...] = ("10.0.0.1",)
+    # node ip -> the address off-cluster peers reach that node on; a node absent
+    # from the mapping reports None, like one whose deployment set nothing.
+    node_external_ips: dict[str, str] = field(default_factory=dict)
     base_port: int = 15000
     handles: list[FakeRayActorHandle] = field(default_factory=list)
     calls: list[FakeRayActorCall] = field(default_factory=list)
@@ -191,6 +204,8 @@ class FakeRayCluster:
     def _compute_value(self, *, handle: FakeRayActorHandle, method: str, kwargs: dict[str, Any]) -> Any:
         if method == _ASYNC_METHOD_NODE_IP:
             return handle.node_ip
+        if method == _ASYNC_METHOD_NODE_EXTERNAL_IP:
+            return self.node_external_ips.get(handle.node_ip)
         if method == _ASYNC_METHOD_TO_LOCAL_GPU_IDS:
             # a worker whose visibility mask hides the leading gpus sees itself starting at 0
             return list(range(len(kwargs["gpu_ids"])))
@@ -202,11 +217,11 @@ class FakeRayCluster:
             )
         return None
 
-    def _alloc_port_block(self, *, node_ip: str, start_port: int, count: int) -> int:
+    def _alloc_port_block(self, *, node_ip: str, start_port: int | None, count: int) -> int:
         used = self._used_ports.setdefault(node_ip, set())
-        # Exactly start_port when it is free, like the real get_free_port: the floor lives in
-        # PortAllocator, and clamping here would make a pinned port look occupied.
-        port = start_port
+        # Exactly the cursor when it is free, like the real probe; a node without a cursor
+        # starts where the service port range starts on a host with the default ephemeral range.
+        port = _SERVICE_PORT_START if start_port is None else start_port
         while any(port + offset in used for offset in range(count)):
             port += 1
         used.update(range(port, port + count))

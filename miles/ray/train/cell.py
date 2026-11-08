@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 
-from miles.ray.specs.train import MASTER_PORT_NAME
+from miles.backends.megatron_utils.checkpoint_request import MegatronCkptLoadConfig
 from miles.ray.train.cell_monitor import compute_cell_status
 from miles.ray.train.cell_state import (
     CellState,
@@ -11,14 +11,16 @@ from miles.ray.train.cell_state import (
     StateAllocatedErrored,
     StateAllocatedUninitialized,
 )
+from miles.utils.async_utils import CancellableTasks
 from miles.utils.ft_utils.api_server.models import CellStatus
 from miles.utils.ft_utils.health_checker import BaseHealthChecker
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
 from miles.utils.retry_utils import NonRetryableError
 from miles.utils.tracking_utils.structured_log import log_structured
+from miles.utils.workers.rpc.client.misc import ServerRestartedError
 from miles.utils.workers.worker_handle import BaseWorkerHandle, WorkerUnreachableError
-from miles.utils.workers.worker_provider.ray import RayWorkerProvider
-from miles.utils.workers.worker_spec import HostAndPort
+from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.worker_spec import MASTER_PORT_NAME, HostAndPort
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +39,8 @@ class TrainerCell:
         cell_id: str,
         cell_index: int,
         workers_hash: str,
-        rollout_executor: object | None,
         health_checker: BaseHealthChecker,
+        provider: BaseWorkerProvider,
     ) -> None:
         self.args = args
         self.cell_id = cell_id
@@ -47,21 +49,26 @@ class TrainerCell:
         self.role = role
         self.with_ref = with_ref
         self.with_opd_teacher = with_opd_teacher
-        self.rollout_executor = rollout_executor
         self.health_checker = health_checker
+        self._disposed = False
+        self._cancellabel_tasks = CancellableTasks()
 
-        (worker_infos,) = RayWorkerProvider.create().get_worker_infos(cell_ids=[cell_id])
+        (worker_infos,) = provider.get_worker_infos(cell_ids=[cell_id])
         self._master_addr: HostAndPort = worker_infos[0].self_addrs[MASTER_PORT_NAME]
+        worker_handles = provider.get_handles_of_worker_infos(worker_infos)
+        assert len(worker_handles) == len(worker_infos), f"cell {cell_id} holds workers that cannot be called"
 
         # NOTE: do *NOT* directly modify `self._state`, but instead use `self._change_state`
-        self._state: CellState = StateAllocatedUninitialized(worker_handles=[info.handle for info in worker_infos])
+        self._state: CellState = StateAllocatedUninitialized(worker_handles=list(worker_handles.values()))
 
     # ------------------------ API ------------------------
 
     async def init(
         self,
         *,
+        ckpt_load_config: MegatronCkptLoadConfig | None,
         indep_dp_info: IndepDPInfo,
+        indep_dp_store_addr: str | None,
         recv_ckpt_src_rank: int | None = None,
     ):
         await self.execute(
@@ -72,16 +79,26 @@ class TrainerCell:
         results = await self.execute(
             "init",
             args=self.args,
+            ckpt_load_config=ckpt_load_config,
             role=self.role,
             with_ref=self.with_ref,
             with_opd_teacher=self.with_opd_teacher,
             indep_dp_info=indep_dp_info,
+            indep_dp_store_addr=indep_dp_store_addr,
             recv_ckpt_src_rank=recv_ckpt_src_rank,
         )
         self._mark_as_alive(indep_dp_info=indep_dp_info)
         self.health_checker.start()
         await asyncio.sleep(0)
         return results
+
+    def dispose(self) -> None:
+        self._disposed = True
+        self.health_checker.stop()
+        self._cancellabel_tasks.cancel()
+
+    async def load_state(self, ckpt_load_config: MegatronCkptLoadConfig | None) -> list:
+        return await self.execute("load_state", ckpt_load_config=ckpt_load_config)
 
     async def train(
         self,
@@ -106,19 +123,17 @@ class TrainerCell:
             ),
         )
 
-    async def set_rollout_executor(self):
-        if (executor := self.rollout_executor) is not None:
-            return await self.execute("set_rollout_executor", rollout_executor=executor)
-        return []
-
     # ------------------------ API :: cooperatively prepare ------------------------
 
     async def prepare_indep_dp_mode_alive(
         self,
         indep_dp_info: IndepDPInfo,
+        indep_dp_store_addr: str | None,
         send_ckpt_dst_ranks: list[int],
     ):
-        await self.execute("reconfigure_indep_dp", indep_dp_info=indep_dp_info)
+        await self.execute(
+            "reconfigure_indep_dp", indep_dp_info=indep_dp_info, indep_dp_store_addr=indep_dp_store_addr
+        )
         self._update_indep_dp_info(indep_dp_info)
 
         for dst_rank in send_ckpt_dst_ranks:
@@ -127,14 +142,15 @@ class TrainerCell:
     async def prepare_indep_dp_mode_healing(
         self,
         indep_dp_info: IndepDPInfo,
+        indep_dp_store_addr: str | None,
         recv_ckpt_src_rank: int | None,
     ):
         await self.init(
+            ckpt_load_config=None,
             indep_dp_info=indep_dp_info,
+            indep_dp_store_addr=indep_dp_store_addr,
             recv_ckpt_src_rank=recv_ckpt_src_rank,
         )
-
-        await self.set_rollout_executor()
 
     # ------------------------ state transition ------------------------
 
@@ -169,6 +185,10 @@ class TrainerCell:
             StateAllocatedAlive,
             StateAllocatedAlive(worker_handles=self._state.worker_handles, indep_dp_info=indep_dp_info),
         )
+
+    async def mark_errored_and_kill(self) -> None:
+        self._mark_as_errored()
+        await self._kill_workers_and_confirm_dead()
 
     def _mark_as_errored(self) -> None:
         assert isinstance(
@@ -210,11 +230,14 @@ class TrainerCell:
 
     # ------------------------ API :: directly forward calls to actors ------------------------
 
-    async def execute(self, fn_name: str, *, kill_on_failure: bool = True, **kwargs) -> list:
+    async def execute(
+        self, fn_name: str, *, kill_on_failure: bool = True, timeout: float | None = None, **kwargs
+    ) -> list:
         return await self._execute_raw(
             fn_name,
             compute_kwargs=lambda _: kwargs,
             kill_on_failure=kill_on_failure,
+            timeout=timeout,
         )
 
     async def _execute_raw(
@@ -222,15 +245,21 @@ class TrainerCell:
         fn_name: str,
         compute_kwargs,
         kill_on_failure: bool = True,
+        timeout: float | None = None,
     ) -> list:
+        if self._disposed:
+            raise WorkerUnreachableError(f"Cell {self.cell_id} was removed")
         handles = self._get_worker_handles()
         log_structured(
             logger.info, tag="ft", op="execute", phase="start", cell=self.cell_id, fn=fn_name, n_actors=len(handles)
         )
         start = time.monotonic()
         try:
-            result = await asyncio.gather(
-                *[getattr(handle, fn_name)(**compute_kwargs(i)) for i, handle in enumerate(handles)]
+            result = await self._cancellabel_tasks.gather(
+                (
+                    getattr(handle, fn_name)(**compute_kwargs(i)) for i, handle in enumerate(handles)
+                ),  # config-access-exempt: attribute selected at runtime from fn_name
+                timeout=timeout,
             )
             log_structured(
                 logger.info,
@@ -243,6 +272,10 @@ class TrainerCell:
                 elapsed_s=round(time.monotonic() - start, 1),
             )
             return result
+        except asyncio.CancelledError:
+            if self._disposed:
+                raise WorkerUnreachableError(f"Cell {self.cell_id} was removed") from None
+            raise
         except Exception:
             log_structured(
                 logger.error,
@@ -254,9 +287,8 @@ class TrainerCell:
                 elapsed_s=round(time.monotonic() - start, 1),
                 exc_info=True,
             )
-            if kill_on_failure:
-                self._mark_as_errored()
-                await self._kill_workers_and_confirm_dead()
+            if kill_on_failure and not self._disposed:
+                await self.mark_errored_and_kill()
             raise
 
     # ------------------------ state and misc queries ------------------------
@@ -299,7 +331,7 @@ class TrainerCell:
 async def _kill_worker(handle: BaseWorkerHandle) -> None:
     try:
         await asyncio.wait_for(handle.kill_self(), timeout=KILL_RPC_TIMEOUT_S)
-    except WorkerUnreachableError:
+    except (WorkerUnreachableError, ServerRestartedError):
         return
     except (TimeoutError, asyncio.TimeoutError):
         logger.warning("Timed out asking a worker to kill itself; falling back to the death confirmation probe")

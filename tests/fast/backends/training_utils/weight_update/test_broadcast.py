@@ -1,12 +1,14 @@
 import asyncio
 import threading
 from argparse import Namespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from miles.backends.training_utils.weight_update.protocols.broadcast import (
+    UpdateWeightFromDistributed,
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     update_weights_from_distributed,
@@ -89,7 +91,6 @@ class TestConnectRolloutEnginesFromDistributed:
         ):
             ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
             result = connect_rollout_engines_from_distributed(
-                Namespace(),
                 "miles-pp_0",
                 engines,
                 engine_gpu_counts=[2, 4, 1],
@@ -110,6 +111,20 @@ class TestConnectRolloutEnginesFromDistributed:
             "group_name": "miles-pp_0",
         }
 
+    def test_missing_gpu_counts_are_rejected_before_any_engine_is_asked(self) -> None:
+        """The inference controller always reports per-engine GPU counts, so a caller without them is a bug."""
+        engines = [MagicMock(spec=_AcceptingEngine) for _ in range(2)]
+
+        with (
+            patch(f"{_BROADCAST_MODULE}.init_process_group") as init_process_group,
+            pytest.raises(AssertionError),
+        ):
+            connect_rollout_engines_from_distributed("miles-pp_0", engines)
+
+        init_process_group.assert_not_called()
+        for engine in engines:
+            engine.init_weights_update_group.assert_not_called()
+
     def test_an_engine_that_refuses_the_group_fails_the_connect(self) -> None:
         """The submitted joins are awaited, so a refusing engine surfaces instead of being dropped."""
         with (
@@ -119,10 +134,45 @@ class TestConnectRolloutEnginesFromDistributed:
             ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
             with pytest.raises(RuntimeError, match="engine refused the group"):
                 connect_rollout_engines_from_distributed(
-                    Namespace(rollout_num_gpus_per_engine=2),
                     "miles-pp_0",
                     [_AcceptingEngine(), _AcceptingEngine(), _RefusingEngine()],
+                    engine_gpu_counts=[2, 2, 2],
                 )
+
+
+class TestUpdateWeightFromDistributedConnect:
+    def test_the_protocol_forwards_discovered_gpu_counts_to_the_group_builder(self) -> None:
+        """The protocol must not replace heterogeneous discovered counts with the uniform fallback."""
+        initial_parallel_state = SimpleNamespace(
+            pp=SimpleNamespace(size=1, rank=0),
+            tp=SimpleNamespace(rank=0),
+            intra_dp_cp=SimpleNamespace(rank=0),
+        )
+        with patch(f"{_BROADCAST_MODULE}.get_parallel_state", return_value=initial_parallel_state):
+            protocol = UpdateWeightFromDistributed(Namespace(check_weight_update_equal=False))
+
+        engines = [MagicMock(name="prefill"), MagicMock(name="decode")]
+        parallel_state = SimpleNamespace(pp=SimpleNamespace(rank=0))
+        with (
+            patch(f"{_BROADCAST_MODULE}.get_data_replica_rank_and_size", return_value=(0, 1)),
+            patch(f"{_BROADCAST_MODULE}.disconnect_rollout_engines_from_distributed"),
+            patch(f"{_BROADCAST_MODULE}.connect_rollout_engines_from_distributed") as connect,
+        ):
+            protocol.connect(
+                engines,
+                engine_gpu_counts=[2, 4],
+                engine_gpu_offsets=[0, 2],
+                engine_cell_ids=["cell-0", "cell-1"],
+                parallel_state=parallel_state,
+                placement=SimpleNamespace(gather_pp=False),
+                selector="all",
+            )
+
+        connect.assert_called_once_with(
+            "miles-pp_0",
+            engines,
+            engine_gpu_counts=[2, 4],
+        )
 
 
 class TestDisconnectRolloutEnginesFromDistributed:
@@ -134,7 +184,6 @@ class TestDisconnectRolloutEnginesFromDistributed:
             dist_mock.destroy_process_group.side_effect = RuntimeError("nccl teardown failed")
             with pytest.raises(RuntimeError, match="nccl teardown failed"):
                 disconnect_rollout_engines_from_distributed(
-                    Namespace(),
                     "miles-pp_0",
                     MagicMock(name="nccl_group"),
                     engines,
@@ -182,3 +231,18 @@ class TestUpdateWeightsFromDistributed:
         assert [handle.waited for handle in handles] == [True, True]
         assert [tensor.is_contiguous() for tensor in broadcast_tensors] == [True, True]
         assert torch.equal(broadcast_tensors[1], _BASE_NAMED_TENSORS[1][1])
+
+
+class TestUpdateWeightFromDistributedLoraBaseResync:
+    @pytest.mark.parametrize("checker", [True, False])
+    def test_the_weight_checker_forces_a_base_resync(self, checker: bool) -> None:
+        """The checker scrambles the engine base before the first sync, so a LoRA sync must resend it."""
+        parallel_state = SimpleNamespace(
+            pp=SimpleNamespace(size=1, rank=0),
+            tp=SimpleNamespace(rank=0),
+            intra_dp_cp=SimpleNamespace(rank=0),
+        )
+        with patch(f"{_BROADCAST_MODULE}.get_parallel_state", return_value=parallel_state):
+            protocol = UpdateWeightFromDistributed(Namespace(check_weight_update_equal=checker))
+
+        assert protocol.needs_base_resync_for_lora is checker

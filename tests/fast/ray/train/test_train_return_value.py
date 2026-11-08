@@ -6,20 +6,25 @@ import pytest
 import ray
 from tests.fast.ray.train.conftest import get_raw_actor_handles, make_alive_cell
 
-from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
+from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
 from miles.ray.train.group import TrainerController
+from miles.utils.data import RolloutDataPack
 from miles.utils.ft_utils.health_checker import ActivenessTracker
+from miles.utils.object_store import _MooncakeStoreObjectRef
 from miles.utils.ray_utils import Box
 
 pytestmark = pytest.mark.asyncio
 
-_DUMMY_DATA_PACK = {"data_ref": "data", "sample_indices": [0]}
+_DUMMY_DATA_PACK = RolloutDataPack(sample_indices=[0], data_ref=_MooncakeStoreObjectRef(payload="data"))
 
 
 def _make_controller(cells: list) -> TrainerController:
     group = object.__new__(TrainerController)
     group._cells_by_id = {cell.cell_id: cell for cell in cells}
-    group.args = SimpleNamespace(enable_event_analyzer=False, save_debug_event_data=None)
+    group.args = SimpleNamespace(
+        enable_event_analyzer=False, save_debug_event_data=None, enable_sample_ownership_checker=False
+    )
+    group._role = "critic"
     group._witness_allocator = None
     group._indep_dp_quorum_id = 0
     group._health_checker_activeness = ActivenessTracker(active=True)

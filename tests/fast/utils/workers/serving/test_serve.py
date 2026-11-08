@@ -4,35 +4,51 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import ModuleType
 
 import httpx
 import pytest
-from tests.fast.utils.workers.import_probe import unexpected_light_entrypoint_imports
-from tests.fast.utils.workers.serving.serve_smoke_worker import IMPORTED_MODULES_ENV_VAR, SmokeWorker
+from tests.fast.utils.workers.serving.registered_serve import REGISTERED_SERVE_MODULE, pod_env, serve_config_argv
+from tests.fast.utils.workers.serving.serve_smoke_worker import (
+    POOL_ID,
+    SMOKE_EXTRA_ENV_VAR,
+    SmokeServeSpec,
+    SmokeWorker,
+    SmokeWorkerConfig,
+)
 
+from miles.ray.specs.entrypoint import SERVE_SPEC_CLASSES
 from miles.utils.http_utils import find_available_port
+from miles.utils.workers.env_vars import SUBPROCESS_INDEX_ENV_VAR
 from miles.utils.workers.rpc.client.handle import RpcWorkerHandle
 from miles.utils.workers.rpc.client.misc import ServerRestartedError
 from miles.utils.workers.serving import serve as serve_module
+from miles.utils.workers.serving import serve_inner
 from miles.utils.workers.serving.utils import split_worker_argv
 from miles.utils.workers.worker_handle import WorkerUnreachableError
 
 _REPO_ROOT = Path(__file__).resolve().parents[5]
-_WORKER_PATH = "tests.fast.utils.workers.serving.serve_smoke_worker.make_worker"
-_ENV_FN_PATH = "tests.fast.utils.workers.serving.serve_smoke_worker.compute_env_vars"
+
+
+def _smoke_own_argv(monkeypatch: pytest.MonkeyPatch, *, worker_argv: list[str]) -> list[str]:
+    config = SmokeWorkerConfig(rpc_port=9000, worker_argv=worker_argv)
+    monkeypatch.setitem(SERVE_SPEC_CLASSES, SmokeServeSpec.worker_type, SmokeServeSpec)
+    for name, value in pod_env(SmokeServeSpec.create(config)).items():
+        monkeypatch.setenv(name, value)
+    return serve_config_argv(spec_class=SmokeServeSpec, config=config)
 
 
 class TestSplitWorkerArgv:
     def test_splits_on_the_separator(self):
         """Everything after -- is worker argv, everything before belongs to the entrypoint."""
-        assert split_worker_argv(["--worker", "m:f", "--", "--greeting", "hi"]) == (
-            ["--worker", "m:f"],
+        assert split_worker_argv(["--pool-id", "p", "--", "--greeting", "hi"]) == (
+            ["--pool-id", "p"],
             ["--greeting", "hi"],
         )
 
     def test_no_separator_means_no_worker_argv(self):
         """Without a separator the whole argv belongs to the entrypoint."""
-        assert split_worker_argv(["--worker", "m:f"]) == (["--worker", "m:f"], [])
+        assert split_worker_argv(["--pool-id", "p"]) == (["--pool-id", "p"], [])
 
     def test_later_separators_stay_with_the_worker(self):
         """Only the first separator splits, so worker argv may contain its own --."""
@@ -40,98 +56,65 @@ class TestSplitWorkerArgv:
 
 
 class TestOuterServeForwarding:
-    def test_only_env_hook_is_consumed_before_exec(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The outer serve layer forwards all non-hook own arguments verbatim."""
+    def test_forwards_its_own_argv_and_the_env_the_spec_computed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """serve exists to put the spec's env on the exec'd image; anything it swallowed would never arrive."""
         captured: dict[str, object] = {}
 
         def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
             captured.update(path=path, argv=argv, env=env)
 
         monkeypatch.setattr(serve_module.os, "execve", fake_execve)
-        monkeypatch.setattr(
-            serve_module,
-            "load_function",
-            lambda path: lambda worker_argv: {"MILES_TEST_ENV": ",".join(worker_argv)},
-        )
-
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                "serve.py",
-                "--worker",
-                "package.worker",
-                "--host",
-                "127.0.0.1",
-                "--env-var-fn",
-                "package.env",
-                "--port",
-                "9000",
-                "--",
-                "--flag",
-                "value",
-            ],
-        )
+        worker_argv = ["--flag", "value"]
+        own_argv = _smoke_own_argv(monkeypatch, worker_argv=worker_argv)
+        monkeypatch.setattr(sys, "orig_argv", [sys.executable, "serve.py", *own_argv])
+        monkeypatch.setattr(sys, "argv", ["serve.py", *own_argv])
 
         serve_module.main()
 
-        assert captured["argv"] == [
-            sys.executable,
-            "-m",
-            "miles.utils.workers.serving.serve_inner",
-            "--worker",
-            "package.worker",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "9000",
-            "--",
-            "--flag",
-            "value",
-        ]
-        assert captured["env"]["MILES_TEST_ENV"] == "--flag,value"
+        assert captured["argv"] == [sys.executable, "-m", "miles.utils.workers.serving.serve_inner", *own_argv]
+        assert captured["env"]["MILES_SERVE_SMOKE_ENV"] == ",".join(worker_argv)
+        assert captured["env"]["MILES_SERVE_SMOKE_POOL_ID"] == POOL_ID
 
-    def test_env_var_hook_overrides_same_named_parent_variable(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_computed_env_overrides_the_parent_without_dropping_unrelated_variables(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A computed variable wins over a same-named variable inherited from the parent environment."""
+        """A computed variable replaces its parent value while unrelated inherited variables survive."""
         captured: dict[str, object] = {}
 
         def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
             captured.update(path=path, argv=argv, env=env)
 
-        monkeypatch.setenv("MILES_TEST_ENV", "from-parent")
-        monkeypatch.setenv("MILES_TEST_UNTOUCHED", "kept")
+        computed_name = "MILES_TEST_COMPUTED_ENV"
+        inherited_name = "MILES_TEST_INHERITED_ENV"
         monkeypatch.setattr(serve_module.os, "execve", fake_execve)
-        monkeypatch.setattr(
-            serve_module,
-            "load_function",
-            lambda path: lambda worker_argv: {"MILES_TEST_ENV": ",".join(worker_argv)},
-        )
-
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                "serve.py",
-                "--worker",
-                "package.worker",
-                "--env-var-fn",
-                "package.env",
-                "--",
-                "--flag",
-                "value",
-            ],
-        )
+        monkeypatch.setenv(SMOKE_EXTRA_ENV_VAR, computed_name)
+        monkeypatch.setenv(computed_name, "from-parent")
+        monkeypatch.setenv(inherited_name, "kept")
+        own_argv = _smoke_own_argv(monkeypatch, worker_argv=[])
+        monkeypatch.setattr(sys, "argv", ["serve.py", *own_argv])
 
         serve_module.main()
 
-        assert captured["env"]["MILES_TEST_ENV"] == "--flag,value"
-        assert captured["env"]["MILES_TEST_UNTOUCHED"] == "kept"
+        env = captured["env"]
+        assert isinstance(env, dict)
+        assert env[computed_name] == "0"
+        assert env[inherited_name] == "kept"
+
+    def test_refuses_a_spec_that_overwrites_the_identity_the_platform_gave_the_pod(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--train-env-vars is unrestricted json, and one of these keys makes every rank claim worker zero."""
+        monkeypatch.setattr(serve_module.os, "execve", _refuse_exec)
+        monkeypatch.setenv(SMOKE_EXTRA_ENV_VAR, SUBPROCESS_INDEX_ENV_VAR)
+        own_argv = _smoke_own_argv(monkeypatch, worker_argv=[])
+        monkeypatch.setattr(sys, "argv", ["serve.py", *own_argv])
+
+        with pytest.raises(AssertionError, match=SUBPROCESS_INDEX_ENV_VAR):
+            serve_module.main()
+
+
+def _refuse_exec(path: str, argv: list[str], env: dict[str, str]) -> None:
+    raise AssertionError("a spec that overwrites the pod's identity must not reach exec")
 
 
 class TestOuterServeInterpreterFlags:
@@ -146,6 +129,7 @@ class TestOuterServeInterpreterFlags:
             captured.update(path=path, argv=argv, env=env)
 
         monkeypatch.setattr(serve_module.os, "execve", fake_execve)
+        own_argv = _smoke_own_argv(monkeypatch, worker_argv=[])
         monkeypatch.setattr(
             sys,
             "orig_argv",
@@ -156,11 +140,10 @@ class TestOuterServeInterpreterFlags:
                 "faulthandler",
                 "-m",
                 "miles.utils.workers.serving.serve",
-                "--worker",
-                "package.worker",
+                *own_argv,
             ],
         )
-        monkeypatch.setattr(sys, "argv", ["serve.py", "--worker", "package.worker"])
+        monkeypatch.setattr(sys, "argv", ["serve.py", *own_argv])
 
         serve_module.main()
 
@@ -171,34 +154,18 @@ class TestOuterServeInterpreterFlags:
             "faulthandler",
             "-m",
             "miles.utils.workers.serving.serve_inner",
-            "--worker",
-            "package.worker",
-            "--",
+            *own_argv,
         ]
         assert captured["path"] == sys.executable
 
 
 def _spawn_serve(port: int) -> subprocess.Popen:
-    env = dict(os.environ)
+    config = SmokeWorkerConfig(rpc_port=port, worker_argv=["--greeting", "hello"])
+    env = dict(os.environ) | pod_env(SmokeServeSpec.create(config))
     env["PYTHONPATH"] = f"{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
 
     return subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "miles.utils.workers.serving.serve",
-            "--worker",
-            _WORKER_PATH,
-            "--env-var-fn",
-            _ENV_FN_PATH,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--",
-            "--greeting",
-            "hello",
-        ],
+        [sys.executable, "-m", REGISTERED_SERVE_MODULE, *serve_config_argv(spec_class=SmokeServeSpec, config=config)],
         cwd=_REPO_ROOT,
         env=env,
     )
@@ -224,8 +191,8 @@ def _stop(process: subprocess.Popen) -> None:
 
 
 class TestServeEndToEnd:
-    async def test_serve_call_argv_and_env(self):
-        """serve.py boots a worker subprocess that answers typed calls with argv and env applied."""
+    async def test_serve_call_config_and_env(self):
+        """serve.py boots a worker subprocess that answers typed calls with its config and env applied."""
         port = find_available_port(20000 + os.getpid() % 10000)
         process = _spawn_serve(port)
 
@@ -238,10 +205,9 @@ class TestServeEndToEnd:
             try:
                 await _wait_ready_or_die(handle, process)
                 assert await handle.demo_sync(a=3, b=4) == 7
-                assert await handle.report_argv() == ["--greeting", "hello"]
+                assert (await handle.report_argv())[-2:] == ["--greeting", "hello"]
                 assert await handle.report_env(name="MILES_SERVE_SMOKE_ENV") == "--greeting,hello"
-                reported = await handle.report_env(name=IMPORTED_MODULES_ENV_VAR)
-                assert unexpected_light_entrypoint_imports(reported) == []
+                assert await handle.report_env(name="MILES_SERVE_SMOKE_POOL_ID") == POOL_ID
             finally:
                 _stop(process)
 
@@ -277,3 +243,15 @@ class TestServeEndToEnd:
                 if second_process is not None:
                     _stop(second_process)
                 _stop(first_process)
+
+
+class TestCompleteWorkerPayload:
+    @pytest.mark.parametrize("entrypoint", [serve_module, serve_inner])
+    def test_worker_defaults_cannot_fill_missing_serialized_fields(
+        self, monkeypatch: pytest.MonkeyPatch, incomplete_worker_argv: list[str], entrypoint: ModuleType
+    ) -> None:
+        """Both serving entrypoints reject omitted worker fields before creating the worker spec."""
+        monkeypatch.setattr(sys, "argv", [entrypoint.__name__, *incomplete_worker_argv])
+
+        with pytest.raises(ValueError, match="worker_argv"):
+            entrypoint.main()

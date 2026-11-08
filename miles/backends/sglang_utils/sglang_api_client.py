@@ -1,12 +1,28 @@
 import asyncio
 import dataclasses
 import logging
+from enum import Enum
+from typing import Any
 
 import httpx
 
 from miles.utils.http_utils import GeneralHttpClientProvider
 
 logger = logging.getLogger(__name__)
+
+
+class WorkerType(Enum):
+    REGULAR = "regular"
+    PREFILL = "prefill"
+    DECODE = "decode"
+    PLACEHOLDER = "placeholder"
+
+    @classmethod
+    def from_server_info(cls, server_info: dict[str, Any]) -> "WorkerType":
+        mode = server_info["disaggregation_mode"]
+        if mode == "null":
+            mode = "regular"
+        return cls(mode)
 
 
 def _compute_headers(api_key: str | None) -> dict[str, str]:
@@ -58,25 +74,50 @@ async def wait_server_healthy(server_url, api_key):
 @dataclasses.dataclass(frozen=True)
 class SGLangApiClient:
     server_url: str
+    api_key: str | None = None
 
-    async def _make_request(self, endpoint: str, payload: dict | None = None):
+    @property
+    def _headers(self) -> dict[str, str]:
+        return _compute_headers(self.api_key)
+
+    async def _make_request(
+        self,
+        endpoint: str,
+        payload: dict | None = None,
+        *,
+        timeout: float | None = None,
+        body: bytes | None = None,
+    ):
         """Make a POST request to the specified endpoint with the given payload.
 
         Args:
             endpoint: The API endpoint to call
             payload: The JSON payload to send (default: empty dict)
+            body: An already JSON-encoded payload, sent as is instead of ``payload``
 
         Returns:
             The JSON response from the server
         """
         url = f"{self.server_url}/{endpoint}"
-        response = await GeneralHttpClientProvider.client().post(url, json=payload or {})
+        bound: dict[str, float] = {} if timeout is None else dict(timeout=timeout)
+        if body is None:
+            response = await GeneralHttpClientProvider.client().post(
+                url, json=payload or {}, headers=self._headers, **bound
+            )
+        else:
+            response = await GeneralHttpClientProvider.client().post(
+                url, content=body, headers={**self._headers, "Content-Type": "application/json"}, **bound
+            )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
-            if hasattr(e, "add_note"):
+            if hasattr(
+                e, "add_note"
+            ):  # config-access-exempt: exception notes are unavailable on older Python versions
                 e.add_note(f"{response.text=}")
             raise
+        if not response.content:
+            return None
         return response.json()
 
     async def health_generate(self, timeout: float = 5.0) -> bool:
@@ -93,6 +134,7 @@ class SGLangApiClient:
         """
         response = await GeneralHttpClientProvider.client().get(
             f"{self.server_url}/health_generate",
+            headers=self._headers,
             timeout=timeout,
         )
         response.raise_for_status()
@@ -125,20 +167,26 @@ class SGLangApiClient:
             payload,
         )
 
-    async def get_remote_instance_transfer_engine_info(self, rank: int):
+    async def update_weights_from_tensor_encoded(self, body: bytes):
+        """``update_weights_from_tensor`` with the JSON body already encoded, so one encode can serve many engines."""
+        return await self._make_request("update_weights_from_tensor", body=body)
+
+    async def get_remote_instance_transfer_engine_info(self, rank: int, role: str):
         # TODO: will be changed to `remote_instance_transfer_engine_info` when the sglang side is ready.
         response = await GeneralHttpClientProvider.client().get(
             f"{self.server_url}/get_remote_instance_transfer_engine_info",
-            params={"rank": rank},
+            params={"rank": rank, "role": role},
+            headers=self._headers,
             timeout=5.0,
         )
         response.raise_for_status()
         return response.json()["remote_instance_transfer_engine_info"]
 
-    async def get_parallelism_info(self, rank: int):
+    async def get_parallelism_info(self, rank: int, role: str):
         response = await GeneralHttpClientProvider.client().get(
             f"{self.server_url}/parallelism_config",
-            params={"rank": rank},
+            params={"rank": rank, "role": role},
+            headers=self._headers,
             timeout=5.0,
         )
         response.raise_for_status()
@@ -147,6 +195,7 @@ class SGLangApiClient:
     async def get_server_info(self):
         response = await GeneralHttpClientProvider.client().get(
             f"{self.server_url}/server_info",
+            headers=self._headers,
             timeout=5.0,
         )
         response.raise_for_status()
@@ -232,7 +281,9 @@ class SGLangApiClient:
         last_message = None
         for _ in range(60):
             try:
-                response = await GeneralHttpClientProvider.client().get(f"{self.server_url}/flush_cache")
+                response = await GeneralHttpClientProvider.client().get(
+                    f"{self.server_url}/flush_cache", headers=self._headers
+                )
                 if response.status_code == 200:
                     break
                 last_message = response.text
@@ -246,7 +297,9 @@ class SGLangApiClient:
     async def get_weight_version(self):
         # new sglang change api from /get_weight_version to /model_info
         for endpoint in ("/model_info", "/get_weight_version"):
-            response = await GeneralHttpClientProvider.client().get(f"{self.server_url}{endpoint}")
+            response = await GeneralHttpClientProvider.client().get(
+                f"{self.server_url}{endpoint}", headers=self._headers
+            )
             if response.status_code == 200:
                 return response.json()["weight_version"]
         response.raise_for_status()
@@ -256,6 +309,12 @@ class SGLangApiClient:
         return await self._make_request(
             "register_lora_adapter",
             {"lora_name": lora_name, "config_dict": config_dict, "pinned": pinned},
+        )
+
+    async def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False, upsert: bool = False):
+        """Load a PEFT adapter directory. With ``upsert``, a same-name adapter is replaced in place."""
+        return await self._make_request(
+            "load_lora_adapter", {"lora_name": lora_name, "lora_path": lora_path, "pinned": pinned, "upsert": upsert}
         )
 
     async def release_memory_occupation(self, tags: list[str] = None):
@@ -276,12 +335,19 @@ class SGLangApiClient:
         )
 
     async def check_weights(
-        self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        selector: str = "all",
+        skip_list: list[str] | None = None,
+        names: list[str] | None = None,
     ):
         payload = {"action": action, "allow_quant_error": allow_quant_error, "selector": selector}
         if skip_list is not None:
             # sglang's CheckWeightsReqInput names this field `skip_tensor_list`.
             payload["skip_tensor_list"] = skip_list
+        if names is not None:
+            payload["names"] = names
         return await self._make_request("weights_checker", payload)
 
     async def pull_weights(self, target_version: int, local_checkpoint_dir: str, source_dir: str):
@@ -350,6 +416,7 @@ class SGLangApiClient:
         flush_cache=False,
         weight_version: str | None = None,
         selector: str = "all",
+        load_format: str | None = None,
     ):
         payload = {
             "names": names,
@@ -361,6 +428,8 @@ class SGLangApiClient:
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if load_format is not None:
+            payload["load_format"] = load_format
         return await self._make_request(
             "update_weights_from_distributed",
             payload,
@@ -370,14 +439,20 @@ class SGLangApiClient:
         response = await GeneralHttpClientProvider.client().post(
             f"{self.server_url}/pause_generation",
             json={"mode": mode},
+            headers=self._headers,
         )
         response.raise_for_status()
         return response
 
     async def continue_generation(self):
-        response = await GeneralHttpClientProvider.client().post(f"{self.server_url}/continue_generation", json={})
+        response = await GeneralHttpClientProvider.client().post(
+            f"{self.server_url}/continue_generation", json={}, headers=self._headers
+        )
         response.raise_for_status()
         return response
+
+    async def abort_all_requests(self, timeout: float | None = None):
+        return await self._make_request("abort_request", {"abort_all": True}, timeout=timeout)
 
     async def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
         """Open a weight-update session on the engine. sync_base=False declares an
@@ -420,11 +495,14 @@ class SGLangApiClient:
                 "with_stack": with_stack,
                 "record_shapes": record_shapes,
             },
+            headers=self._headers,
         )
         response.raise_for_status()
         return response
 
     async def stop_profile(self):
-        response = await GeneralHttpClientProvider.client().post(f"{self.server_url}/stop_profile", json={})
+        response = await GeneralHttpClientProvider.client().post(
+            f"{self.server_url}/stop_profile", json={}, headers=self._headers
+        )
         response.raise_for_status()
         return response

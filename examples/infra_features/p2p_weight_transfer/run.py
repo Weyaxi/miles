@@ -638,8 +638,8 @@ def cmd_prepare(model_name: str, download_only: bool = False, ckpt_dir: str | No
     for ds in cfg.datasets:
         run_cmd(
             f'python3 -c "'
-            f"from miles.utils.external_utils.command_utils import hf_download_dataset; "
-            f"hf_download_dataset('{ds}')"
+            f"from miles.utils.external_utils import command_utils; "
+            f"command_utils.default_config().create_backend().hf_download_dataset('{ds}')"
             f'"'
         )
 
@@ -657,8 +657,8 @@ def cmd_prepare(model_name: str, download_only: bool = False, ckpt_dir: str | No
 
         run_cmd(
             f'python3 -c "'
-            f"from miles.utils.external_utils.command_utils import convert_checkpoint; "
-            f"convert_checkpoint("
+            f"from miles.utils.external_utils import command_utils; "
+            f"command_utils.default_config().create_backend().convert_checkpoint("
             f"model_name='{model_name}', "
             f"megatron_model_type='{cfg.model_type}', "
             f"num_gpus_per_node={cfg.convert_gpus_per_node}, "
@@ -683,6 +683,7 @@ def cmd_run(
     mode: str = "p2p",
     node_rank: int = 0,
     head_ip: str = "",
+    p2p_transport: str = "mooncake",
 ):
     """Launch training with P2P or broadcast weight transfer."""
     if model_name not in RUN_CONFIGS:
@@ -977,7 +978,11 @@ def cmd_run(
 
     # P2P-specific SGLang args
     if mode == "p2p":
-        args.append("--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine")
+        args.append(
+            "--sglang-remote-instance-weight-loader-start-seed-via-nixl"
+            if p2p_transport == "nixl"
+            else "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine"
+        )
 
     # Skip validation / model loader
     if skip_validation:
@@ -1027,6 +1032,8 @@ def cmd_run(
         args.append("--check-weight-update-equal")
 
     args.extend(["--update-weight-transfer-mode", mode])
+    if mode == "p2p" and p2p_transport == "nixl":
+        args.extend(["--p2p-transport", "nixl"])
 
     # --- Submit Ray job (head node only, or single-node) ---
     if is_single_node or node_rank == 0:
@@ -1117,8 +1124,20 @@ def main():
         )
         parser.add_argument("--node-rank", type=int, default=0, help="Node rank (0=head, default: 0)")
         parser.add_argument("--head-ip", default="", help="Head node IP (auto-detect for single-node)")
+        parser.add_argument(
+            "--p2p-transport",
+            default="mooncake",
+            choices=["mooncake", "nixl"],
+            help="P2P transport (default: mooncake)",
+        )
         parsed = parser.parse_args(sys.argv[2:])
-        cmd_run(parsed.model, mode=parsed.mode, node_rank=parsed.node_rank, head_ip=parsed.head_ip)
+        cmd_run(
+            parsed.model,
+            mode=parsed.mode,
+            node_rank=parsed.node_rank,
+            head_ip=parsed.head_ip,
+            p2p_transport=parsed.p2p_transport,
+        )
 
     else:
         print(f"Unknown subcommand: {subcmd}")

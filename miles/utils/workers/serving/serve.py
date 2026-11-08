@@ -1,38 +1,47 @@
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 
-from miles.utils.function_registry import load_function
+from miles.ray.specs.entrypoint import SERVE_SPEC_CLASSES
+from miles.utils.args.schema import validate_complete_config
 from miles.utils.workers.argv_utils import python_argv_prefix
-from miles.utils.workers.serving.utils import split_worker_argv
+from miles.utils.workers.env_vars import PLATFORM_IDENTITY_ENV_VARS
+from miles.utils.workers.serving.utils import parse_own_args, parse_serve_worker_config
+from miles.utils.workers.serving.worker_identity import read_worker_identity
+from miles.utils.workers.worker_spec import WorkerLaunchContext
+
+SERVE_INNER_MODULE = "miles.utils.workers.serving.serve_inner"
 
 
 def main() -> None:
-    own_argv, worker_argv = split_worker_argv(sys.argv[1:])
+    own_args = parse_own_args(sys.argv[1:])
 
-    parser = argparse.ArgumentParser(description="Compute worker env vars, then exec into the rpc server")
-    parser.add_argument("--env-var-fn", default=None, help="Env var computation function as 'package.module.callable'")
-    args, inner_own_argv = parser.parse_known_args(own_argv)
-    _log(f"start own_argv={own_argv} worker_argv={worker_argv}")
+    worker_config = parse_serve_worker_config(own_args.config)
+    spec_class = SERVE_SPEC_CLASSES[worker_config.worker_type]
+    spec = spec_class.create(
+        validate_complete_config(config_class=spec_class.config_class, payload=worker_config.args)
+    )
+    identity = read_worker_identity(os.environ)
+    env_vars = spec.env_var(
+        WorkerLaunchContext(
+            args=spec.args,
+            cell_index=identity.cell_index,
+            worker_in_cell_index=identity.worker_in_cell_index,
+            num_workers_per_cell=identity.num_workers_per_cell,
+            gpu_ids=identity.gpu_ids,
+        )
+    )
+    overridden = sorted(name for name in PLATFORM_IDENTITY_ENV_VARS if name in env_vars)
+    assert not overridden, (
+        f"spec {spec.name} sets {overridden}, which the platform owns; a worker that read the spec's value "
+        f"would report the identity of another worker and bind that worker's ports"
+    )
+    _log(f"pool_id={spec.name} env_vars={env_vars}")
 
-    env = dict(os.environ)
-    if args.env_var_fn is not None:
-        computed_env_vars: dict[str, str] = load_function(args.env_var_fn)(worker_argv)
-        _log(f"env_var_fn={args.env_var_fn} computed={computed_env_vars}")
-        env.update(computed_env_vars)
-
-    inner_argv = [
-        *python_argv_prefix(),
-        "-m",
-        "miles.utils.workers.serving.serve_inner",
-        *inner_own_argv,
-        "--",
-        *worker_argv,
-    ]
-    _log(f"exec {inner_argv}")
-    os.execve(sys.executable, inner_argv, env)
+    inner_argv = [*python_argv_prefix(), "-m", SERVE_INNER_MODULE, *sys.argv[1:]]
+    _log(f"exec {SERVE_INNER_MODULE} pool_id={spec.name}")
+    os.execve(sys.executable, inner_argv, dict(os.environ) | env_vars)
 
 
 def _log(message: str) -> None:

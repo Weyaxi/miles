@@ -36,13 +36,13 @@ from pathlib import Path
 
 import torch
 
+from miles.backends.training_utils.metrics.train_dump import save_debug_train_data_for_rank
 from miles.ray.rollout.debug_data import save_dashboard_columns, save_debug_rollout_data
 from miles.ray.rollout.train_data_conversion import (
     convert_samples_to_train_data,
     process_rollout_data_shard,
     split_train_data_by_dp_raw,
 )
-from miles.utils.train_dump_utils import save_debug_train_data_for_rank
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 
@@ -160,7 +160,14 @@ def _make_args(dump_dir: Path, *, num_prompts: int, n_samples_per_prompt: int) -
         rollout_batch_size=num_prompts,
         n_samples_per_prompt=n_samples_per_prompt,
         reward_key=None,
+        length_penalty_coeff=0.0,
+        length_penalty_min_tokens=1,
         qkv_format="thd",
+        rollout_top_logprobs_num=0,
+        enable_sample_ownership_checker=False,
+        use_rollout_routing_replay=False,
+        use_rollout_indexer_replay=False,
+        use_output_store=False,
     )
 
 

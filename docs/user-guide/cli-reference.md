@@ -85,7 +85,7 @@ then push up until you OOM.
 | `--rollout-max-response-len` | `–` | Max tokens per response. |
 | `--rollout-stop-token-ids` | model default | Stop token IDs. Override when generations don't stop. |
 | `--apply-chat-template` | off | Apply the tokenizer's chat template. |
-| `--rollout-shuffle` | off | Shuffle prompts each rollout. |
+| `--rollout-shuffle` | on | Shuffle prompts once per epoch. `--no-rollout-shuffle` keeps file order. |
 
 ### Optimizer
 
@@ -142,6 +142,7 @@ Sections mirror the launch-script argument groups.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
+| `--cluster-backend` | enum | `ray` | `ray` launches workers from the driver; `kubernetes` expects them to already exist. `kubernetes` is refused during validation until a later milestone provisions those workers. Under `kubernetes`, `--use-prometheus` is ignored. |
 | `--actor-num-nodes` | int | `1` | Total nodes for actor training. |
 | `--actor-num-gpus-per-node` | int | `8` | GPUs per actor node. |
 | `--rollout-num-gpus` | int | derived | Ignored under `--colocate`. |
@@ -158,6 +159,7 @@ Sections mirror the launch-script argument groups.
 | `--load` | path | – | Actor checkpoint to resume from. |
 | `--save` | path | – | Actor checkpoint write directory. |
 | `--save-interval` | int | – | Rollouts between saves. |
+| `--async-save` | flag | off | Write Megatron checkpoint shards asynchronously. With `--save-hf`, the native write overlaps the HF export. |
 | `--save-trigger-sentinel` | path | – | If this file exists at a save point, save a checkpoint now (regardless of `--save-interval`) and remove the file. |
 | `--custom-megatron-post-save-hook-path` | `<module>.<fn>` | – | Rank-0 callback after each checkpoint save. |
 | `--model-name` | str | – | Set in multi-node to avoid `transformers` file-system race. |
@@ -168,11 +170,12 @@ Sections mirror the launch-script argument groups.
 | Flag | Type | Default | Notes |
 |---|---|---|---|
 | `--prompt-data` | str | – | Path to a single JSONL file. |
+| `--rollout-data-yaml-config` | str | – | YAML of several datasets mixed by weight; replaces `--prompt-data`. See [Mixing Datasets](/user-guide/mixing-datasets). |
 | `--input-key` | str | `input` | JSONL key to `Sample.prompt`. |
 | `--label-key` | str | `None` | JSONL key to `Sample.label`. |
 | `--metadata-key` | str | `metadata` | JSONL key to `Sample.metadata`. |
 | `--apply-chat-template` | flag | off | Apply tokenizer chat template. |
-| `--rollout-shuffle` | flag | off | Shuffle prompts each rollout. |
+| `--rollout-shuffle` | flag | on | Shuffle prompts once per epoch (seeded by `--rollout-seed`). `--no-rollout-shuffle` keeps file order. |
 | `--num-rollout` | int | – | Total rollout iterations. If unset, derived from dataset size. |
 | `--rollout-batch-size` | int | – | Prompts per rollout. |
 | `--n-samples-per-prompt` | int | `1` | Responses per prompt. |
@@ -186,6 +189,7 @@ Sections mirror the launch-script argument groups.
 | Flag | Type | Default | Notes |
 |---|---|---|---|
 | `--rollout-max-response-len` | int | – | Max tokens per response. |
+| `--max-seq-len` | int | – | Total tokens per session, including prompts, completions, and environment responses. Sample assembly truncates each collected trajectory to it, and the agent receives it in `metadata`; Miles does not stop the agent at it (see [Choose the session behavior](/user-guide/agentic-rollout#choose-the-session-behavior)). On `/generate`, each request's `max_new_tokens` is capped to fit it, and a request with no room left stops the sample as `TRUNCATED`. Defaults `--rollout-max-prompt-len` to one less. |
 | `--rollout-temperature` | float | `1.0` | Sampling temperature. |
 | `--rollout-top-p` | float | `1.0` | Top-p truncation. Values below `1` require bounded [sampling-support replay](/advanced/sampling-support-replay). |
 | `--rollout-top-k` | int | `-1` | Top-k truncation (`-1` disables). Positive values enable [sampling-support replay](/advanced/sampling-support-replay). |
@@ -228,7 +232,7 @@ Sections mirror the launch-script argument groups.
 | `--recompute-method` | enum | Megatron default | `uniform` or `block`. |
 | `--recompute-num-layers` | int | Megatron default | Recompute chunk size. |
 | `--gradient-checkpointing` | flag | off | FSDP equivalent of recompute flags. |
-| `--fsdp-cpu-offload` | flag | off | FSDP: offload params, grads, optimizer state to CPU. |
+| `--optimizer-cpu-offload` | flag | off | FSDP / torchtitan: offload params, grads, optimizer state to CPU (Megatron: its own HybridDeviceOptimizer). `--fsdp-cpu-offload` is the deprecated spelling. |
 | `--fsdp-cpu-backend` | str | `gloo` | FSDP: CPU backend for hybrid offload. |
 | `--dp-replicate-size` | int | `1` | FSDP2 hybrid-shard replica count. |
 | `--attn-implementation` | str | `flash_attention_2` | FSDP only: passed to `transformers`, e.g. `flash_attention_2`, `flash_attention_3`, `sdpa`, `eager`. |
@@ -315,13 +319,15 @@ contract, session behavior, and model-family selection.
 |---|---|---|---|
 | `--custom-generate-function-path` | `<module>.<fn>` | – | Set to `miles.rollout.generate_hub.agentic_tool_call.generate` for the built-in agentic wrapper. |
 | `--custom-agent-function-path` | `<module>.<fn>` | – | Async agent-environment loop. Registered after selecting the built-in agentic wrapper. |
+| `--custom-agent-function-mode` | `subproc` / `inline` | `subproc` | Where each agent call runs: a child process of its own, or the rollout's event loop. See [Where the agent runs](/user-guide/agentic-rollout#where-the-agent-runs). |
 | `--use-session-server` | optional `v1` / `v2` | off | Bare flag (or `v1`) selects the linear append-only server; `v2` selects tree serving. Requires `--hf-checkpoint`. |
 | `--tito-model` | enum | `default` | TITO model family. Named families load their registered fixed template; `default` is best-effort with a checkpoint-native or custom template. |
-| `--max-seq-len` | int | – | Total tokens per session, including prompts, completions, and environment responses. Registered with the agentic wrapper. |
+| `--allow-stop-token-replace` / `--no-allow-stop-token-replace` | bool | family default | Whether the session server may replace the sampled stop token with the first token of the appended render (GLM stopping at `<\|observation\|>` before a non-tool message). Allowed replacements log a warning; otherwise the request gets HTTP 400. Allowed by default only for `glm47` and `glm53`. Allowing it cannot be combined with `--sglang-enable-streaming-session`. |
 | `--session-server-ip` | str | router IP | Session-server bind address. |
+| `--session-server-external-host` | str | – | Host that peers outside the cluster reach every session server on. Keeps the session servers on the head node. Leave unset when each node sets `MILES_NODE_EXTERNAL_IP`. |
 | `--session-server-port` | int | auto | First port for standalone session-server instances. When unset, each worker port is auto-allocated. |
 | `--session-server-workers` | int | `32` | Number of instances, at least 1; an explicit `--session-server-port` anchors a consecutive range. |
-| `--session-sample-picker-path` | `<module>.<fn>` | `drop_retries` | v2 only: selects leaf samples before post-processing. |
+| `--session-sample-picker-path` | `<module>.<fn>` | `drop_same_prompt_retries` | v2 only: selects leaf samples before post-processing. The default trims identical re-sends, including a re-sent first turn; `drop_rolled_back_leaves` also trims a leaf whose later sibling sent a different request. |
 | `--session-sample-postprocessor-path` | `<module>.<fn>` | `default_postprocess` | v2 only: finalizes loss masks and rewards. |
 
 `--use-session-server v2` returns `list[Sample]` and rejects `--group-rm`, `--partial-rollout`, and `--recompute-logprobs-via-prefill`.
@@ -330,8 +336,8 @@ contract, session behavior, and model-family selection.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
-| `--mtp-num-layers` | int | `0` | Number of MTP layers in the checkpoint. |
-| `--enable-mtp-training` | flag | off | Train MTP alongside the policy. |
+| `--mtp-num-layers` | int | – | MTP layers the model has; built only with `--enable-mtp-training`. |
+| `--enable-mtp-training` | flag | off | Build and train the MTP layers alongside the policy (Megatron only). |
 | `--mtp-loss-scaling-factor` | float | `0.2` | Weight of MTP loss. |
 
 ### Fault tolerance
@@ -364,12 +370,15 @@ contract, session behavior, and model-family selection.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
-| `--profile-target` | enum+ | `[train_overall]` | Which sub-loop to profile: `train_overall`, `train_actor`, `train_log_probs`. |
-| `--use-pytorch-profiler` | flag | off | FSDP only: enable PyTorch profiler. |
-| `--profile-step-start` | int | `10` | FSDP only: first step to profile. |
-| `--profile-step-end` | int | `12` | FSDP only: last step to profile. |
-| `--memory-snapshot-path` | str | `snapshot.pickle` | FSDP only: memory snapshot output. |
-| `--tensorboard-dir` | str | – | FSDP only: TensorBoard output dir. |
+| `--profile-target` | enum+ | `[train_overall]` | Which loop to profile: `train_overall`, `train_actor`, `train_log_probs` (the last two not on Megatron). |
+| `--use-pytorch-profiler` | flag | off | Enable the PyTorch profiler. This and the rows below are Megatron's flags; FSDP and torchtitan mirror them. |
+| `--profile-step-start` | int | `10` | First step to trace (a rollout step for `train_overall`). |
+| `--profile-step-end` | int | `12` | Tracing stops before this step. |
+| `--profile-ranks` | int+ | `[]` | Global ranks to trace; an empty list traces every rank. Megatron owns the default: `[]` in the Miles images, `[0]` in older upstream releases such as the NPU setup's. |
+| `--pytorch-profiler-collect-callstack` | flag | off | Record Python call stacks (much larger traces). |
+| `--pytorch-profiler-collect-shapes` | flag | off | Record tensor shapes. |
+| `--memory-snapshot-path` | str | `snapshot.pickle` | File name suffix of the `--record-memory-history` snapshot. |
+| `--tensorboard-dir` | str | – | Trace output dir. |
 
 ### Debugging
 
@@ -377,7 +386,7 @@ contract, session behavior, and model-family selection.
 |---|---|---|---|
 | `--debug-rollout-only` | flag | off | Skip Megatron, only spin up SGLang. |
 | `--debug-train-only` | flag | off | Skip SGLang, only spin up Megatron. |
-| `--save-debug-rollout-data` | path | – | Pickle every rollout to disk. |
+| `--save-debug-rollout-data` | path | – | Pickle every rollout to disk. The template must contain `{rollout_id}`. |
 | `--load-debug-rollout-data` | path | – | Replay rollouts from disk (implies `--debug-train-only`). |
 | `--deterministic-mode` | flag | off | Megatron deterministic mode. |
 

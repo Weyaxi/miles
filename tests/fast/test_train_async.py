@@ -1,15 +1,34 @@
 import asyncio
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-
 import train_async as train_async_driver
-from tests.fast.fixtures.driver_fakes import FakeInferenceController, FakeRolloutExecutor, FakeTrainingModel
+from tests.fast.fixtures.args_fixtures import parser_defaults, resolve_parse_boundary_configs
+from tests.fast.fixtures.driver_fakes import (
+    FakeInferenceController,
+    FakeObjectStore,
+    FakeRemoteMethod,
+    FakeRolloutExecutor,
+    FakeTrainingModel,
+    FakeWorkerManager,
+)
+
+from miles.backends.megatron_utils.megatron_config import MegatronTrainerConfig
+from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
+from miles.ray import placement_group as placement_group_mod
+from miles.ray import wiring
+from miles.utils import object_store
+from miles.utils.async_utils import with_disposer
+from miles.utils.orchestration_utils import ArgvOrchestratorStartupInfo
 
 
 def _make_args(**overrides: Any) -> SimpleNamespace:
     args = SimpleNamespace(
+        **parser_defaults(),
+    )
+    defaults: dict[str, Any] = dict(
         api_server_host="127.0.0.1",
         api_server_port=None,
         check_weight_update_allow_quant_error=False,
@@ -40,9 +59,13 @@ def _make_args(**overrides: Any) -> SimpleNamespace:
         use_rollout_logprobs=False,
         use_tis=False,
     )
-    for key, value in overrides.items():
+    for key, value in {**defaults, **overrides}.items():
         setattr(args, key, value)
-    return args
+    return resolve_parse_boundary_configs(args)
+
+
+def _startup_info(args: SimpleNamespace) -> ArgvOrchestratorStartupInfo:
+    return ArgvOrchestratorStartupInfo(args=args, all_args=args)
 
 
 def _install_driver_fakes(
@@ -54,29 +77,49 @@ def _install_driver_fakes(
         actor_model=FakeTrainingModel(events, "actor"),
         critic_model=FakeTrainingModel(events, "critic") if args.use_critic else None,
         api_server_calls=[],
+        cell_operations=object(),
     )
+    capability = SimpleNamespace(cell_operations=lambda: components.cell_operations)
 
-    async def create_rollout_components(_args: SimpleNamespace) -> tuple[Any, Any, int]:
+    handles = {"actor": components.actor_model}
+    if args.use_critic:
+        handles["critic"] = components.critic_model
+
+    def create_trainer_handles(
+        _args: SimpleNamespace, *, trainer_configs: list[MegatronTrainerConfig], capability: Any
+    ) -> dict[str, FakeTrainingModel]:
+        assert [config.trainer_id for config in trainer_configs] == list(handles)
+        return handles
+
+    async def create_rollout_components(
+        _args: SimpleNamespace, *, capability: Any, trainer_handles: dict[str, FakeTrainingModel]
+    ) -> tuple[Any, Any, int]:
+        assert trainer_handles is handles
         return components.inference_controller, components.rollout_executor, 4
 
-    async def create_training_models(_args: SimpleNamespace, _controller: Any, _executor: Any) -> tuple[Any, Any]:
+    async def create_training_models(
+        _args: SimpleNamespace, _executor: Any, *, handles: dict[str, FakeTrainingModel]
+    ) -> tuple[Any, Any]:
+        assert handles["actor"] is components.actor_model
+        if args.use_critic:
+            assert handles["critic"] is components.critic_model
         return components.actor_model, components.critic_model
 
-    async def update_weights(_model: Any, _executor: Any, rollout_id: int | None = None) -> None:
+    async def update_weights(
+        _args: Any, _model: Any, _executor: Any, _inference_controller: Any, *, rollout_id: int | None = None
+    ) -> None:
         events.append(f"update_weights:{rollout_id}")
 
-    monkeypatch.setattr(train_async_driver, "configure_logger", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(train_async_driver, "maybe_start_periodic_pyspy_dump", lambda: None)
-    monkeypatch.setattr(train_async_driver, "launch_worker_manager", lambda _args: None)
-    monkeypatch.setattr(train_async_driver.object_store, "init_instance", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(train_async_driver, "init_tracking", lambda _args: None)
+    monkeypatch.setattr(train_async_driver, "init_orchestration_script", lambda _startup_info, *, disposer: capability)
+    monkeypatch.setattr(train_async_driver, "create_trainer_handles", create_trainer_handles)
     monkeypatch.setattr(train_async_driver, "create_rollout_components", create_rollout_components)
     monkeypatch.setattr(train_async_driver, "create_training_models", create_training_models)
     monkeypatch.setattr(train_async_driver, "maybe_start_mini_ft_controller", lambda _args: None)
     monkeypatch.setattr(train_async_driver, "update_weights", update_weights)
     monkeypatch.setattr(train_async_driver, "remove_rollout_data_refs", lambda *_args, **_kwargs: None)
+    # the driver reaches the server through maybe_start_api_server, whose gate the tests exercise
     monkeypatch.setattr(
-        train_async_driver, "start_api_server", lambda **kwargs: components.api_server_calls.append(kwargs)
+        placement_group_mod, "start_api_server", lambda **kwargs: components.api_server_calls.append(kwargs)
     )
     return components
 
@@ -88,11 +131,13 @@ class TestApiServer:
         args = _make_args(api_server_port=8123, ft_components=["rollout"])
         components = _install_driver_fakes(monkeypatch, args, events)
 
-        await train_async_driver.train(args)
+        await with_disposer(train_async_driver.train, _startup_info(args))
 
         (call,) = components.api_server_calls
-        assert call["actor_model"] is components.actor_model
+        assert list(call["trainer_models"]) == ["actor"]
+        assert call["trainer_models"]["actor"] is components.actor_model
         assert call["inference_controller"] is components.inference_controller
+        assert call["cell_operations"] is components.cell_operations
         assert call["port"] == 8123
         assert call["ft_components"] == ["rollout"]
 
@@ -102,7 +147,7 @@ class TestApiServer:
         args = _make_args(api_server_port=None)
         components = _install_driver_fakes(monkeypatch, args, events)
 
-        await train_async_driver.train(args)
+        await with_disposer(train_async_driver.train, _startup_info(args))
 
         assert components.api_server_calls == []
 
@@ -119,7 +164,7 @@ class TestWeightEqualityCheck:
         )
         components = _install_driver_fakes(monkeypatch, args, events)
 
-        await train_async_driver.train(args)
+        await with_disposer(train_async_driver.train, _startup_info(args))
 
         assert components.inference_controller.check_weights_calls == [
             dict(
@@ -140,7 +185,7 @@ class TestPipelinedGeneration:
         held_generation = asyncio.Event()
         components.rollout_executor.generation_gates[1] = held_generation
 
-        driver = asyncio.create_task(train_async_driver.train(args))
+        driver = asyncio.create_task(with_disposer(train_async_driver.train, _startup_info(args)))
         await asyncio.wait_for(components.actor_model.train_started[0].wait(), timeout=10)
 
         assert "generate_start:1" in events
@@ -160,7 +205,7 @@ class TestPipelinedGeneration:
         args = _make_args(fully_async=True, num_rollout=2, update_weights_interval=1)
         components = _install_driver_fakes(monkeypatch, args, events)
 
-        await train_async_driver.train(args)
+        await with_disposer(train_async_driver.train, _startup_info(args))
 
         assert events.index("actor_train:0") < events.index("update_weights:0")
         assert events.index("update_weights:0") < events.index("generate_start:1")
@@ -173,7 +218,7 @@ class TestPipelinedGeneration:
         args = _make_args(fully_async=True, num_rollout=3, update_weights_interval=2)
         components = _install_driver_fakes(monkeypatch, args, events)
 
-        await train_async_driver.train(args)
+        await with_disposer(train_async_driver.train, _startup_info(args))
 
         assert events.index("generate_start:1") < events.index("actor_train:0")
         assert events.index("actor_train:1") < events.index("update_weights:1")
@@ -181,7 +226,81 @@ class TestPipelinedGeneration:
         assert components.actor_model.trained == [0, 1, 2]
 
 
+class TestCriticValuesHandoff:
+    async def test_async_critic_outputs_reach_the_actor_and_are_released_after_training(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pipelined critic value references stay live through the actor step that consumes them."""
+        events: list[str] = []
+        args = _make_args(num_rollout=1, use_critic=True, keep_old_actor=True)
+        components = _install_driver_fakes(monkeypatch, args, events)
+        store = FakeObjectStore()
+        monkeypatch.setattr(object_store, "_INSTANCE", store)
+        ref = store.put("critic-values")
+        values = [TrainStepOutput(outcome=TrainStepOutcome.NORMAL, values=ref)]
+        components.critic_model.train_outputs[0] = values
+
+        def consume_critic_values(external_data: list[TrainStepOutput]) -> None:
+            assert external_data is values
+            assert store.get(external_data[0].values).value == "critic-values"
+
+        components.actor_model.consume_external_data = consume_critic_values
+
+        await with_disposer(train_async_driver.train, _startup_info(args))
+
+        assert store.consumed == [ref]
+        assert not store.contains(ref)
+
+
 class TestTerminalLifecycle:
+    @pytest.mark.parametrize("audit_fails", [False, True])
+    async def test_final_audit_runs_with_live_api_and_cells(
+        self, monkeypatch: pytest.MonkeyPatch, audit_fails: bool
+    ) -> None:
+        """Final audits retain a working observation endpoint even when the audit raises."""
+        events: list[str] = []
+        args = _make_args()
+        components = _install_driver_fakes(monkeypatch, args, events)
+
+        def close_api() -> None:
+            events.append("api_closed")
+
+        async def final_audit() -> None:
+            assert "api_closed" not in events
+            assert "actor_dispose" not in events
+            assert "inference_dispose" not in events
+            events.append("audit")
+            if audit_fails:
+                raise RuntimeError("audit failed")
+
+        monkeypatch.setattr(train_async_driver, "maybe_start_api_server", lambda *args, **kwargs: close_api)
+        monkeypatch.setattr(components.rollout_executor, "_dispose", final_audit)
+
+        if audit_fails:
+            with pytest.raises(RuntimeError, match="audit failed"):
+                await with_disposer(train_async_driver.train, _startup_info(args))
+        else:
+            await with_disposer(train_async_driver.train, _startup_info(args))
+
+        assert events.count("audit") == 1
+        assert events.index("audit") < events.index("api_closed") < events.index("actor_dispose")
+        assert "inference_dispose" in events
+
+    async def test_model_creation_failure_still_disposes_rollout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Startup failure before the API exists still releases the rollout components."""
+        events: list[str] = []
+        args = _make_args()
+        _install_driver_fakes(monkeypatch, args, events)
+
+        async def fail_creation(*args: Any, handles: dict[str, FakeTrainingModel]) -> None:
+            raise RuntimeError("model creation failed")
+
+        monkeypatch.setattr(train_async_driver, "create_training_models", fail_creation)
+        with pytest.raises(RuntimeError, match="model creation failed"):
+            await with_disposer(train_async_driver.train, _startup_info(args))
+
+        assert events == ["executor_dispose", "inference_dispose"]
+
     async def test_async_train_drains_eval_and_disposes_all_component_controllers(
         self, monkeypatch: pytest.MonkeyPatch
     ):
@@ -190,7 +309,7 @@ class TestTerminalLifecycle:
         args = _make_args(use_critic=True, keep_old_actor=True, eval_interval=1, hf_checkpoint="/ckpt/hf")
         _install_driver_fakes(monkeypatch, args, events)
 
-        await train_async_driver.train(args)
+        await with_disposer(train_async_driver.train, _startup_info(args))
 
         assert "eval:0" in events
         assert sorted(event for event in events if event.endswith("_dispose")) == [
@@ -199,3 +318,45 @@ class TestTerminalLifecycle:
             "executor_dispose",
             "inference_dispose",
         ]
+
+    async def test_async_train_releases_its_worker_manager_after_eval_and_component_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The async driver releases its own manager after eval draining and component cleanup."""
+        events: list[str] = []
+        args = _make_args(use_critic=True, keep_old_actor=True, eval_interval=1, hf_checkpoint="/ckpt/hf")
+        manager = FakeWorkerManager(events)
+        _install_driver_fakes(monkeypatch, args, events)
+
+        def init_orchestration_script(_startup_info: ArgvOrchestratorStartupInfo, *, disposer: Any) -> None:
+            disposer.add(partial(wiring.shutdown_worker_manager, manager))
+
+        monkeypatch.setattr(train_async_driver, "init_orchestration_script", init_orchestration_script)
+        monkeypatch.setattr(wiring.ray, "kill", manager.kill)
+
+        await with_disposer(train_async_driver.train, _startup_info(args))
+
+        assert manager.killed == [manager]
+        assert events.index("eval:0") < events.index("manager_shutdown")
+        assert all(
+            events.index(event) < events.index("manager_shutdown") for event in events if event.endswith("_dispose")
+        )
+        assert events.index("manager_shutdown") < events.index("manager_kill")
+
+
+class TestOutputStoreRelease:
+    async def test_each_rollout_is_released_once_it_has_trained(self, monkeypatch: pytest.MonkeyPatch):
+        """The executor may delete a rollout's stored objects only after every trainer read them."""
+        events: list[str] = []
+        args = _make_args(num_rollout=3)
+        components = _install_driver_fakes(monkeypatch, args, events)
+        trained_at_release: list[tuple[int, list[int]]] = []
+
+        async def release(rollout_id: int) -> None:
+            trained_at_release.append((rollout_id, list(components.actor_model.trained)))
+
+        components.rollout_executor.release = FakeRemoteMethod(release)
+
+        await with_disposer(train_async_driver.train, _startup_info(args))
+
+        assert trained_at_release == [(0, [0]), (1, [0, 1]), (2, [0, 1, 2])]

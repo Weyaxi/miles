@@ -3,32 +3,46 @@ import os
 import re
 import sys
 import warnings
+
+from miles.utils.audit_utils.config_snapshot.dumper import ConfigSnapshotDumper
+from miles.utils.audit_utils.config_snapshot.enabled import SNAPSHOT_TESTING_ENABLED
 from miles.utils.audit_utils.event_logger.logger import EventLogger, is_event_logger_initialized, set_event_logger
 from miles.utils.audit_utils.process_identity import ProcessIdentity
+from miles.utils.env_report.reporter import EnvReporter, start_env_reporting
 
-_LOGGER_CONFIGURED = False
+_STRICT_ASYNC_WARNINGS_INSTALLED = False
+_ENV_REPORTER: EnvReporter | None = None
 
 logger = logging.getLogger(__name__)
 
 _FATAL_ASYNC_PATTERN = "coroutine .* was never awaited"
 
 
-def configure_logger(args, *, source: ProcessIdentity) -> None:
+def configure_logger(args, *, source: ProcessIdentity, report_env: bool = True) -> None:
     name = source.to_name()
     configure_logger_raw(name)
+    if SNAPSHOT_TESTING_ENABLED:
+        ConfigSnapshotDumper.configure(args=args, source=source)
+        ConfigSnapshotDumper.dump(stage="process_config", config={"args": args})
 
-    if (event_dir := getattr(args, "save_debug_event_data", None)) is not None:
+    if (event_dir := args.save_debug_event_data) is not None:
         if not is_event_logger_initialized():
             set_event_logger(EventLogger(log_dir=event_dir, file_name=f"{name}.jsonl", source=source))
+
+    global _ENV_REPORTER
+    if report_env and _ENV_REPORTER is None:
+        _ENV_REPORTER = start_env_reporting(args)
+
+
+def rebind_env_reporting(args) -> None:
+    # TODO: stop rebinding here; the args object should not be overwritten in place all over the codebase.
+    if _ENV_REPORTER is not None:
+        _ENV_REPORTER.rebind(args)
 
 
 # ref: SGLang
 def configure_logger_raw(name: str = "") -> None:
-    global _LOGGER_CONFIGURED
-    if _LOGGER_CONFIGURED:
-        return
-
-    _LOGGER_CONFIGURED = True
+    global _STRICT_ASYNC_WARNINGS_INSTALLED
 
     logging.basicConfig(
         level=logging.INFO,
@@ -37,7 +51,9 @@ def configure_logger_raw(name: str = "") -> None:
         force=True,
     )
 
-    configure_strict_async_warnings()
+    if not _STRICT_ASYNC_WARNINGS_INSTALLED:
+        _STRICT_ASYNC_WARNINGS_INSTALLED = True
+        configure_strict_async_warnings()
 
 
 def configure_strict_async_warnings() -> None:

@@ -4,64 +4,93 @@ from contextlib import suppress
 
 import uvicorn
 
-from miles.ray.rollout.inference_controller import InferenceController
-from miles.ray.train.group import TrainerController
-from miles.ray.wiring import launch_worker_manager
-from miles.tinker.arguments import add_tinker_arguments, configure_tinker_args
+from miles.backends.training_utils.checkpoint.adapter.parametrization import base_model_fingerprint
+from miles.ray.placement_group import create_trainer_handles
+from miles.ray.rollout.router_manager import resolve_router_addrs
+from miles.ray.specs.inference import compute_router_providers, create_inference_controller_handle
+from miles.ray.specs.train import ACTOR_ROLE, compute_trainer_configs
+from miles.ray.train.init_request import TrainerControllerInitRequest
+from miles.tinker.arguments import configure_tinker_args, validate_tinker_args
 from miles.tinker.core.service import TinkerService
 from miles.tinker.core.types import GatewayConfig
-from miles.tinker.runtime import MilesBackend
+from miles.tinker.runtime import MilesBackend, take_checkpoint_root
 from miles.tinker.server.app import build_app
-from miles.utils import object_store
+from miles.tinker.server.encoding import assert_installed_sdk_version
+from miles.utils.args.trainer_utils import compute_trainer_ckpt_load_config
 from miles.utils.arguments import parse_args
-from miles.utils.audit_utils.process_identity import MainProcessIdentity
+from miles.utils.async_utils import Disposer, with_disposer
 from miles.utils.hf_utils.config import load_hf_config
 from miles.utils.http_utils import init_http_client
-from miles.utils.logging_utils import configure_logger
+from miles.utils.lora.hf_lora_targets import get_hf_lora_targets
+from miles.utils.orchestration_utils import ArgvOrchestratorStartupInfo, init_orchestration_script
 
 logger = logging.getLogger(__name__)
 
 
-async def serve(args):
+async def serve(args, *, disposer: Disposer):
+    assert_installed_sdk_version()
     assert args.multi_lora, "serve_tinker requires --multi-lora-n-adapters > 0"
-    assert args.load == args.hf_checkpoint, "Tinker trainers and engines must load the same frozen HF base"
-    checkpoint_root = args.tinker_checkpoint_root or (args.save and f"{args.save}/tinker")
-    assert checkpoint_root, "set --tinker-checkpoint-root (or --save to derive <save>/tinker)"
-    hf_config = load_hf_config(args.hf_checkpoint).get_text_config()
+    validate_tinker_args(args)
+    trainer_configs = compute_trainer_configs(args)
+    [actor_config] = [config for config in trainer_configs if config.role == ACTOR_ROLE]
+    ckpt_load_config = compute_trainer_ckpt_load_config(args, actor_config)
+    assert ckpt_load_config is not None
+    assert ckpt_load_config.load == args.hf_checkpoint, "Tinker trainers and engines must load the same frozen HF base"
+    full_hf_config = load_hf_config(args.hf_checkpoint)
+    hf_config = full_hf_config.get_text_config()
     max_tokens_per_datum = hf_config.max_position_embeddings
     if args.max_tokens_per_gpu is not None:
         # The trainer pads each packed microbatch to this multiple.
-        pad_size = args.tensor_model_parallel_size * args.data_pad_size_multiplier
-        trainer_token_limit = args.max_tokens_per_gpu // pad_size * pad_size
+        pad_size = args.raw_megatron.base_args["tensor_model_parallel_size"] * args.data_pad_size_multiplier
+        local_token_limit = args.max_tokens_per_gpu // pad_size * pad_size
+        if args.raw_megatron.base_args["context_parallel_size"] > 1:
+            # each rank holds two equal zigzag chunks per datum
+            local_token_limit -= local_token_limit % 2
+        trainer_token_limit = local_token_limit * args.raw_megatron.base_args["context_parallel_size"]
         max_tokens_per_datum = min(max_tokens_per_datum, trainer_token_limit)
     assert max_tokens_per_datum > 0, "trainer token budget must fit at least one padding block"
-    configure_logger(args, source=MainProcessIdentity())
+    engine_context_length = args.sglang.common_value("context_length") or hf_config.max_position_embeddings
+    # SGLang rejects inputs with len >= min(context_len - 1, kv_capacity - 1) - 5, assuming the KV pool
+    # exceeds one context; a sequence sampled up to the window must still be accepted as a scoring prompt.
+    max_tokens_per_sample = min(max_tokens_per_datum, engine_context_length - 7)
+    # a second gateway on this root fails here, not after the trainer and engines start; released after they stop
+    checkpoint_root_lock = take_checkpoint_root(args.tinker_checkpoint_root)
+    disposer.add(checkpoint_root_lock.close)
+    capability = init_orchestration_script(ArgvOrchestratorStartupInfo.create(args), disposer=disposer)
+    trainer_request = TrainerControllerInitRequest(
+        num_rollout=args.num_rollout,
+        wandb_run_id=args.wandb_run_id,
+        mlflow_run_id=args.mlflow_run_id,
+        ckpt_load_config=ckpt_load_config,
+    )
 
+    await resolve_router_addrs(args, router_providers=compute_router_providers(args, capability=capability))
+    inference_controller = create_inference_controller_handle(capability=capability)
+    await inference_controller.init()
+    disposer.add(inference_controller)
+    args.inference_runtime_mut_state.set_(await inference_controller.get_inference_runtime_immut_state())
     init_http_client(args)
 
-    _worker_manager = launch_worker_manager(args)
-    object_store.init_instance(args, contribute_segment=False)
+    trainer = create_trainer_handles(args, trainer_configs=trainer_configs, capability=capability)[
+        actor_config.trainer_id
+    ]
+    await trainer.init(trainer_request)
+    disposer.add(trainer)
 
-    inference_controller = InferenceController(args)
-    await inference_controller.init()
-
-    trainer = TrainerController(
-        args=args,
-        role="actor",
-        with_ref=False,
-        with_opd_teacher=False,
-        inference_controller=None,
-        rollout_executor=None,
-    )
-    await trainer.init()
-
+    lora_layout = get_hf_lora_targets(full_hf_config.to_dict())
     config = GatewayConfig(
         base_model=args.tinker_base_model or args.hf_checkpoint,
         n_slots=args.multi_lora_n_adapters,
-        checkpoint_root=checkpoint_root,
+        checkpoint_root=args.tinker_checkpoint_root,
+        public_url=args.tinker_public_url,
         vocab_size=hf_config.vocab_size,
+        exports_tinker_names=bool(lora_layout.tinker_name_renames),
         max_tokens_per_datum=max_tokens_per_datum,
+        max_tokens_per_sample=max_tokens_per_sample,
         lora_alpha=args.lora_alpha,
+        lora_type=args.lora_type,
+        experts_shared_outer_loras=args.experts_shared_outer_loras,
+        base_model_fingerprint=base_model_fingerprint(hf_config.to_dict()),
         max_lora_rank=args.lora_rank,
         trains_attn="attn" in args.tinker_lora_groups,
         trains_mlp="mlp" in args.tinker_lora_groups,
@@ -70,9 +99,11 @@ async def serve(args):
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
     actor_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
     dp_size = actor_world_size // (
-        args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
+        args.raw_megatron.base_args["tensor_model_parallel_size"]
+        * args.raw_megatron.base_args["pipeline_model_parallel_size"]
+        * args.raw_megatron.base_args["context_parallel_size"]
     )
-    service = TinkerService(MilesBackend(trainer, router_url, dp_size=dp_size), config)
+    service = TinkerService(MilesBackend(trainer, router_url, lora_layout, dp_size=dp_size), config)
 
     server = uvicorn.Server(
         uvicorn.Config(
@@ -94,13 +125,7 @@ async def serve(args):
             with suppress(asyncio.CancelledError):
                 await task
 
-    await inference_controller.dispose()
-    await trainer.dispose()
-
 
 if __name__ == "__main__":
-    args = parse_args(add_tinker_arguments, entry="serve", preprocess_args=configure_tinker_args)
-    # commands ship one work unit at a time; its size is the batch size
-    args.use_dynamic_global_batch_size = True
-    args.delay_split_train_data_by_dp = True
-    asyncio.run(serve(args))
+    args = parse_args(entry="serve", preprocess_args=configure_tinker_args)
+    asyncio.run(with_disposer(serve, args))

@@ -25,7 +25,6 @@ Env vars:
                      terminated and scored reward 0 (bounds long-trajectory
                      stragglers that would otherwise stall the whole rollout batch).
   AGENT_MODEL_NAME   model name sent to the policy (default: "model")
-  MILES_ROUTER_EXTERNAL_HOST  optional host rewrite for off-cluster agents
 
 Server contract: the env server must run tbench2_env at or after the
 huggingface/OpenEnv#1025 merge (38b2a3135; install per the README) —
@@ -55,7 +54,8 @@ from collections.abc import Callable
 from typing import Any
 
 from openai import AsyncOpenAI
-from miles.rollout.agentic.session import resolve_session_url
+
+from miles.rollout.agentic.session import openai_session_url
 
 logger = logging.getLogger(__name__)
 
@@ -141,14 +141,22 @@ def _strip_fence(text: str) -> str:
 
 def _obs_field(result: Any, name: str) -> str:
     """Read an Observation field off a StepResult, tolerating shape differences."""
-    obs = getattr(result, "observation", result)
-    return str(getattr(obs, name, "") or "")
+    obs = getattr(
+        result, "observation", result
+    )  # config-access-exempt: OpenEnv clients return either a step result wrapper or a direct observation
+    return str(
+        getattr(obs, name, "") or ""
+    )  # config-access-exempt: OpenEnv environments define different observation text fields
 
 
 def _obs_info(result: Any) -> dict:
     """Read the Observation's info dict off a StepResult (empty when absent)."""
-    obs = getattr(result, "observation", result)
-    return getattr(obs, "info", None) or {}
+    obs = getattr(
+        result, "observation", result
+    )  # config-access-exempt: OpenEnv clients return either a step result wrapper or a direct observation
+    return (
+        getattr(obs, "info", None) or {}
+    )  # config-access-exempt: OpenEnv observation schemas may omit auxiliary info
 
 
 # Lazy import so the file loads without the env client present at import time.
@@ -337,7 +345,9 @@ async def multi_turn(
         #     valid, which is exactly why it must not be trusted: source
         #     preflight is impossible against a remote server, so this marker
         #     is the contract check.
-        raw_reward = getattr(eval_result, "reward", None)
+        raw_reward = getattr(
+            eval_result, "reward", None
+        )  # config-access-exempt: OpenEnv grading responses may omit reward when evaluation fails
         eval_error = _obs_field(eval_result, "error")
         harness = str(_obs_info(eval_result).get("harness", ""))
         if raw_reward is None or eval_error or harness != "tests/test.sh":
@@ -414,7 +424,7 @@ async def run_for_training(
     request_kwargs = request_kwargs or {}
     metadata = metadata or {}
 
-    session_url = resolve_session_url(base_url)
+    session_url = openai_session_url(base_url)
     model_name = os.getenv("AGENT_MODEL_NAME", os.getenv("SWE_AGENT_MODEL_NAME", "model"))
 
     policy = AsyncOpenAI(base_url=session_url, api_key="EMPTY")

@@ -11,7 +11,7 @@ pipeline (sglang + miles-router with session support) is launched, ``train`` is
 skipped, and the rollout drives ``session_verify_agent.run_agent`` against the
 session server.
 
-Args flow through miles' canonical ``parse_args`` Namespace.
+CLI args are validated by miles' canonical ``parse_args`` and adapted to a local Namespace.
 
 # Backend choice
 
@@ -30,8 +30,9 @@ import shutil
 import tempfile
 from typing import Any, Literal
 
-import miles.utils.external_utils.command_utils as U
 from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser
+from miles.utils.external_utils import command_utils
+from miles.utils.external_utils.command_utils.base_backend import BaseCommandBackend
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ SESSION_VERIFY_INVARIANT_ARGS: dict[str, Any] = {
     "session_message_matcher": "strict",
     "debug_rollout_only": True,
     "ci_test": True,
+    "enable_sample_ownership_checker": False,
     "colocate": True,
     "train_backend": "fsdp",
     "sglang_ep_size": 1,
@@ -111,7 +113,7 @@ def _ensure_prompt_data() -> str:
     return PROMPT_DATA_PATH
 
 
-def _ensure_model_downloaded(hf_checkpoint: str) -> str:
+def _ensure_model_downloaded(hf_checkpoint: str, *, backend: BaseCommandBackend) -> str:
     """Return a local model path, downloading HF repos when needed.
 
     Lets callers pass either a HuggingFace repo id (downloaded under
@@ -124,7 +126,7 @@ def _ensure_model_downloaded(hf_checkpoint: str) -> str:
     short = hf_checkpoint.split("/")[-1]
     local_dir = os.path.join(LOCAL_MODELS_ROOT, short)
     os.makedirs(LOCAL_MODELS_ROOT, exist_ok=True)
-    U.exec_command_cpu(f"hf download {hf_checkpoint} --local-dir {local_dir}")
+    backend.exec_command_cpu(f"hf download {hf_checkpoint} --local-dir {local_dir}")
     return local_dir
 
 
@@ -165,7 +167,9 @@ def namespace_to_train_args(ns: argparse.Namespace) -> str:
         f"--actor-num-gpus-per-node {ns.actor_num_gpus_per_node}",
         f"--train-backend {ns.train_backend}",
     ]
-    if getattr(ns, "rollout_num_gpus", None) is not None:
+    if (
+        getattr(ns, "rollout_num_gpus", None) is not None
+    ):  # config-access-exempt: launcher helper accepts namespaces from different CLI providers
         parts.append(f"--rollout-num-gpus {ns.rollout_num_gpus}")
     if ns.sglang_tool_call_parser:
         parts.append(f"--sglang-tool-call-parser {ns.sglang_tool_call_parser}")
@@ -175,7 +179,9 @@ def namespace_to_train_args(ns: argparse.Namespace) -> str:
         parts.append(f"--sglang-kv-cache-dtype {ns.sglang_kv_cache_dtype}")
     if ns.sglang_mamba_full_memory_ratio is not None:
         parts.append(f"--sglang-mamba-full-memory-ratio {ns.sglang_mamba_full_memory_ratio}")
-    if getattr(ns, "sglang_cuda_graph_max_bs_decode", None) is not None:
+    if (
+        getattr(ns, "sglang_cuda_graph_max_bs_decode", None) is not None
+    ):  # config-access-exempt: launcher helper accepts namespaces from different CLI providers
         parts.append(f"--sglang-cuda-graph-max-bs-decode {ns.sglang_cuda_graph_max_bs_decode}")
     if ns.sglang_cuda_graph_backend_prefill is not None:
         parts.append(f"--sglang-cuda-graph-backend-prefill {ns.sglang_cuda_graph_backend_prefill}")
@@ -193,7 +199,9 @@ def namespace_to_train_args(ns: argparse.Namespace) -> str:
                 "--sglang-speculative-num-draft-tokens 3",
             ]
         )
-    if getattr(ns, "anthropic_intermediate_system_expectation", None) is not None:
+    if (
+        getattr(ns, "anthropic_intermediate_system_expectation", None) is not None
+    ):  # config-access-exempt: launcher helper accepts namespaces from different CLI providers
         parts.append("--anthropic-intermediate-system-expectation " f"{ns.anthropic_intermediate_system_expectation}")
     if ns.use_session_server:
         # Preserve an explicit version string ("v2"); a bare True stays the bare flag.
@@ -205,8 +213,10 @@ def namespace_to_train_args(ns: argparse.Namespace) -> str:
         parts.append("--debug-rollout-only")
     if ns.ci_test:
         parts.append("--ci-test")
-    if getattr(ns, "ci_tito_special_token_count_threshold", 0.0):
+    if ns.ci_tito_special_token_count_threshold:
         parts.append(f"--ci-tito-special-token-count-threshold {ns.ci_tito_special_token_count_threshold}")
+    if not ns.enable_sample_ownership_checker:
+        parts.append("--no-enable-sample-ownership-checker")
     if ns.colocate:
         parts.append("--colocate")
     return " ".join(parts) + " "
@@ -235,7 +245,7 @@ def run_session_verify(args: argparse.Namespace, *, wire_format: SessionWireForm
     ``args`` MUST be a fully-shaped Namespace carrying miles-canonical field
     names plus the session-verify-specific fields (``session_verify_cycles``,
     ``tool_call_failure_mode``, ``assistant_text_threshold``).  Build it via
-    ``parse_args(add_custom_arguments=session_verify_extras)`` for the CLI
+    the CLI entrypoint's ``_parse_session_verify_args()`` adapter for the CLI
     path or by spreading ``SESSION_VERIFY_INVARIANT_ARGS`` into
     ``argparse.Namespace(...)`` for tests.
 
@@ -251,12 +261,13 @@ def run_session_verify(args: argparse.Namespace, *, wire_format: SessionWireForm
     if wire_format not in ("openai", "anthropic"):
         raise ValueError(f"unsupported session verification wire format: {wire_format}")
 
+    backend = command_utils.default_config().create_backend()
     args.sglang_reasoning_parser, args.sglang_tool_call_parser = resolve_reasoning_and_tool_call_parser(
         args.tito_model, args.sglang_reasoning_parser, args.sglang_tool_call_parser
     )
     _ensure_prompt_data()
     _clear_proxy_env()
-    args.hf_checkpoint = _ensure_model_downloaded(args.hf_checkpoint)
+    args.hf_checkpoint = _ensure_model_downloaded(args.hf_checkpoint, backend=backend)
 
     train_args = namespace_to_train_args(args)
 
@@ -267,7 +278,7 @@ def run_session_verify(args: argparse.Namespace, *, wire_format: SessionWireForm
     os.close(metrics_fd)
 
     try:
-        U.execute_train(
+        backend.execute_train(
             train_args=train_args,
             num_gpus_per_node=args.actor_num_gpus_per_node,
             megatron_model_type=None,
@@ -276,7 +287,7 @@ def run_session_verify(args: argparse.Namespace, *, wire_format: SessionWireForm
         assert_session_verify_metrics(
             metrics_path,
             assistant_text_threshold=args.assistant_text_threshold,
-            special_token_count_threshold=getattr(args, "ci_tito_special_token_count_threshold", 0.0),
+            special_token_count_threshold=args.ci_tito_special_token_count_threshold,
             require_append_tool=wire_format == "openai",
         )
     except Exception:

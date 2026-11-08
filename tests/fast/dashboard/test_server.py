@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -28,7 +29,12 @@ def dump_dir(tmp_path):
             ts=102.0,
             step_key="rollout/step",
             step=1,
-            metrics={"rollout/rewards_mean": 0.6, "perf/actor_train_mfu": 0.3, "perf/mfu_peak_tflops": 989.0},
+            metrics={
+                "rollout/rewards_mean": 0.6,
+                "rollout/truncated_ratio": 0.25,
+                "perf/actor_train_mfu": 0.3,
+                "perf/mfu_peak_tflops": 989.0,
+            },
         )
     )
     writer.append(MetricsRecord(ts=103.0, step_key="train/step", step=7, metrics={"train/loss": 1.5}))
@@ -59,6 +65,35 @@ def test_meta(client):
     assert meta["data_buffer_length"] is None  # never reported in this fixture
 
 
+class TestMeta:
+    def test_meta_reports_the_step_key_for_each_namespaced_metric(self, tmp_path: Path) -> None:
+        """Each namespaced metric must report the exact axis recorded with its point."""
+        writer = MetricStore(tmp_path / "dashboard")
+        writer.append(
+            MetricsRecord(
+                ts=1.0,
+                step_key="alpha/train/step",
+                step=3,
+                metrics={"alpha/train/loss": 1.5},
+            )
+        )
+        writer.append(
+            MetricsRecord(
+                ts=2.0,
+                step_key="beta/rollout/step",
+                step=4,
+                metrics={"beta/rollout/reward": 0.5},
+            )
+        )
+        writer.flush()
+        client = TestClient(make_app(MetricStore.load(tmp_path / "dashboard"), DumpReader(tmp_path)))
+
+        assert client.get("/api/meta").json()["step_key_of_metric_key"] == {
+            "alpha/train/loss": "alpha/train/step",
+            "beta/rollout/reward": "beta/rollout/step",
+        }
+
+
 def test_meta_reports_latest_data_buffer_length(dump_dir):
     from miles.dashboard.store import DataBufferSample
 
@@ -74,8 +109,8 @@ def test_meta_reports_latest_data_buffer_length(dump_dir):
 def test_advisory_endpoint(client):
     resp = client.get("/api/advisory")
     assert resp.status_code == 200
-    # no engine series in the fixture, but the reader-side rules see the
-    # dummy dump's newest rollout, where a quarter of the samples truncate
+    # no engine series in the fixture, but the rollout rules see the newest
+    # step's logged truncated_ratio: a quarter of the samples truncate
     [advisory] = resp.json()["advisories"]
     assert advisory["level"] == "warning"
     assert "truncated" in advisory["message"]

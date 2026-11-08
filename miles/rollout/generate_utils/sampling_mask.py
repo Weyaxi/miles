@@ -1,6 +1,7 @@
 from argparse import Namespace
 from collections.abc import Mapping, Sequence
 
+from miles.utils.output_store.plan import StorePlanError
 from miles.utils.sampling_mask import RolloutSamplingMask
 from miles.utils.types import Sample
 
@@ -19,7 +20,7 @@ def should_return_sampling_mask(
     return validate_sampling_support_request(
         params,
         replay_enabled=args.use_sampling_support_replay,
-        expected_temperature=float(getattr(args, "rollout_temperature", 1.0)),
+        expected_temperature=float(args.rollout_temperature),
     )
 
 
@@ -95,8 +96,9 @@ def append_sampling_metadata(
     meta_info: dict,
     *,
     aborted: bool = False,
+    sampling_logprobs_mode: str = "selected",
 ) -> list[float]:
-    """Append SGLang's realized support and return its normalized log-probs."""
+    """Append SGLang's realized support and return sampled-token log-probs."""
     supports = meta_info.get("output_token_sampling_mask")
     log_probs = meta_info.get("output_token_sampling_logprobs")
     if supports is None or log_probs is None:
@@ -112,7 +114,42 @@ def append_sampling_metadata(
     if len(log_probs) != len(output_token_ids):
         raise ValueError(f"sampling log-prob length {len(log_probs)} != output token length {len(output_token_ids)}")
 
-    _append_sampling_mask(sample, _sampling_mask_from_supports(output_token_ids, supports))
+    sampling_mask = _sampling_mask_from_supports(output_token_ids, supports)
+    if sampling_logprobs_mode == "support":
+        selected = []
+        for token_id, support, row in zip(output_token_ids, supports, log_probs, strict=True):
+            if not isinstance(row, (list, tuple)) or len(row) != len(support):
+                raise ValueError("SGLang support log-probs must align with the sampling support IDs")
+            matches = [i for i, candidate in enumerate(support) if candidate == token_id]
+            if len(matches) != 1:
+                raise ValueError("Sampled token must occur exactly once in its sampling support")
+            selected.append(float(row[matches[0]]))
+    elif sampling_logprobs_mode == "selected":
+        if any(isinstance(row, (list, tuple)) for row in log_probs):
+            raise ValueError("SGLang selected sampling log-probs must be scalar")
+        selected = [float(value) for value in log_probs]
+    else:
+        raise ValueError(f"Unsupported sampling logprobs mode: {sampling_logprobs_mode}")
+    _append_sampling_mask(sample, sampling_mask)
+    return selected
+
+
+def read_sampled_logprobs(
+    meta_info: dict, output_token_ids: Sequence[int], *, sampling_logprobs_mode: str
+) -> list[float]:
+    """The sampled tokens' log-probs, one per token, when the sampling mask went to the output store."""
+    if sampling_logprobs_mode == "support":
+        # SGLang picked each sampled token's entry out of its support row.
+        key = "output_token_sampling_selected_logprobs"
+    elif sampling_logprobs_mode == "selected":
+        key = "output_token_sampling_logprobs"
+    else:
+        raise ValueError(f"Unsupported sampling logprobs mode: {sampling_logprobs_mode}")
+    log_probs = meta_info.get(key, [])
+    if len(log_probs) != len(output_token_ids):
+        raise StorePlanError(
+            f"SGLang response {key} has {len(log_probs)} values for {len(output_token_ids)} output tokens"
+        )
     return [float(value) for value in log_probs]
 
 

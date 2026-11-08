@@ -53,35 +53,36 @@ def _is_ignored(name: str, ignore_rules: list[str], literal_rules: frozenset[str
 def quantize_params_nvfp4(args, megatron_name, converted_named_params, quantization_config):
     assert quantization_config is not None
     assert quantization_config.get("quant_algo") == "NVFP4" or quantization_config.get("quant_method") == "nvfp4"
-    if args is not None and bool(getattr(args, "fp4_param", False) or getattr(args, "fp4_param_gather", False)):
+    if bool(
+        getattr(args.backend, "fp4_param", False) or getattr(args.backend, "fp4_param_gather", False)
+    ):  # config-access-exempt: FP4 option names differ across Megatron versions
         raise NotImplementedError("fp4-param-gather is unsupported for Miles NVFP4 checkpoint export.")
 
-    if getattr(args, "extra_high_precision_layers_megatron", False):
-        for layer_name in getattr(args, "extra_high_precision_layers_megatron", ()):
+    if args.extra_high_precision_layers_megatron:
+        for layer_name in args.extra_high_precision_layers_megatron:
             if layer_name in megatron_name:
                 return converted_named_params
 
     ignore_rules = _get_ignore_rules(quantization_config)
 
-    decoder_layers_pattern = r"decoder\.layers\.(\d+)\.(.+)"
-    match = re.search(decoder_layers_pattern, megatron_name)
-
+    # Only the main language decoder is eligible; MTP and modality towers stay in high precision.
+    decoder_layers_pattern = r"(?:module\.)*(?:language_model\.)?decoder\.layers\.(\d+)\.(.+)"
+    match = re.match(decoder_layers_pattern, megatron_name)
     if not match:
-        # check mtp layers
-        mtp_layer_pattern = r"mtp\.layers\.(\d+)\.(.+)"
-        match = re.search(mtp_layer_pattern, megatron_name)
-        if not match:
-            return converted_named_params
-        layer_idx, rest = match.groups()
-        rest = rest.replace("transformer_layer.", "").replace("mtp_model_layer.", "")
-    else:
-        layer_idx, rest = match.groups()
+        return converted_named_params
+    layer_idx, rest = match.groups()
 
     # Skip quantization for BF16 tail of main decoder layers.
-    if getattr(args, "first_last_layers_bf16", False):
-        num_layers = int(args.num_layers)
-        num_layers_at_start_in_bf16 = int(getattr(args, "num_layers_at_start_in_bf16", 0))
-        num_layers_at_end_in_bf16 = int(getattr(args, "num_layers_at_end_in_bf16", 0))
+    if getattr(
+        args.backend, "first_last_layers_bf16", False
+    ):  # config-access-exempt: BF16 layer options are absent in older Megatron parsers
+        num_layers = int(args.backend.num_layers)
+        num_layers_at_start_in_bf16 = int(
+            getattr(args.backend, "num_layers_at_start_in_bf16", 0)
+        )  # config-access-exempt: BF16 layer options are absent in older Megatron parsers
+        num_layers_at_end_in_bf16 = int(
+            getattr(args.backend, "num_layers_at_end_in_bf16", 0)
+        )  # config-access-exempt: BF16 layer options are absent in older Megatron parsers
         head_end_idx = num_layers_at_start_in_bf16
         tail_start_idx = num_layers - num_layers_at_end_in_bf16
         if int(layer_idx) < head_end_idx or int(layer_idx) >= tail_start_idx:

@@ -12,7 +12,8 @@
         {"id": 295988875, "login": "ilyasher-harmonic"},
         {"id": 258897383, "login": "vedant-harmonic"},
         {"id": 109944218, "login": "JessicaJiang-123"},
-        {"id": 214322989, "login": "XinyuJiangCMU"}
+        {"id": 214322989, "login": "XinyuJiangCMU"},
+        {"id": 13900043, "login": "michaelzhang-ai"}
       ]
     },
     "repo_write_access": {
@@ -33,12 +34,14 @@
         "run-ci-amd",
         "run-ci-blackwell-only",
         "run-ci-ckpt",
+        "run-ci-deploy",
         "run-ci-eval",
         "run-ci-fsdp",
         "run-ci-ft-long",
         "run-ci-ft-short",
         "run-ci-fully-async",
         "run-ci-image",
+        "run-ci-k8s",
         "run-ci-long",
         "run-ci-lora",
         "run-ci-multi-lora",
@@ -46,11 +49,15 @@
         "run-ci-miles-plugin",
         "run-ci-model-scripts",
         "run-ci-mooncake",
+        "run-ci-multi-policy",
         "run-ci-precision",
         "run-ci-qwen35",
         "run-ci-replay",
+        "run-ci-rollout",
+        "run-ci-rpc-comm",
         "run-ci-sglang",
         "run-ci-short",
+        "run-ci-torchtitan",
         "run-ci-weight-update",
         "run-on-blackwell",
         "run-on-hopper"

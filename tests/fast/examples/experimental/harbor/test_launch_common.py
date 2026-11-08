@@ -17,10 +17,10 @@ def _args(**overrides):
         harbor_trials_dir="/trials",
         agent_model_name="model",
         agent_timeout=5400,
-        router_external_host="trainer.tailnet",
         daytona_api_key_file="",
         e2b_api_key_file="",
         modal_config_file="",
+        novita_api_key_file="",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -29,7 +29,7 @@ def _args(**overrides):
 @pytest.fixture(autouse=True)
 def fake_harbor_and_sdk(monkeypatch):
     """harbor and the provider SDKs only need to be importable for the preflight."""
-    for name in ("harbor", "e2b", "daytona", "modal"):
+    for name in ("harbor", "e2b", "daytona", "modal", "novita_sandbox"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
 
 
@@ -61,7 +61,6 @@ def test_known_provider_is_provisioned_by_key_path(monkeypatch, tmp_path):
 
     assert env["HARBOR_ENV_TYPE"] == "e2b"
     assert env["HARBOR_TASKS_DIR"] == "/tasks"
-    assert env["MILES_ROUTER_EXTERNAL_HOST"] == "trainer.tailnet"
     assert env["E2B_API_KEY_FILE"] == str(key_file)
     assert env["E2B_API_URL"] == "http://agentenv.internal:8000"
     assert "e2b_secret" not in str(env)

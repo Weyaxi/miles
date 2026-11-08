@@ -146,11 +146,15 @@ skip):
 
 ```bash
 export NEMO_GYM_URL="http://<nemo-gym-host>:12000"
-# Only if the NeMo Gym host cannot resolve the trainer's hostname (e.g. it
-# reaches the trainer over a tailnet):
-export MILES_ROUTER_EXTERNAL_HOST="<trainer host/IP reachable from that host>"
 python examples/experimental/nemo-gym/run.py
 ```
+
+If the NeMo Gym host cannot resolve the trainer's hostname (e.g. it reaches the
+trainer over a tailnet), add
+`--session-server-external-host <trainer host/IP reachable from that host>`. It
+publishes every session server at that host and keeps them on the head node.
+When each trainer pod has its own reachable address, have the deployment set
+`MILES_NODE_EXTERNAL_IP` in each pod instead.
 
 To wire the connector into a different launch script, the essential pieces
 are this example's directory on `PYTHONPATH`, and:
@@ -224,17 +228,14 @@ on CPU-only machines, in three independent layers (all three pass as of
 
 ## Troubleshooting
 
-1. `train.py: error: unrecognized arguments: --max-seq-len
-   --custom-agent-function-path`: `MILES_USE_LEGACY_ROLLOUT_V1=1` is set in the
-   training environment — the legacy path never registers the agentic flags.
-2. `mini_swe_agent_2` dies at spin-up with an unresolvable-dependency error
+1. `mini_swe_agent_2` dies at spin-up with an unresolvable-dependency error
    (`openai==X` vs `nemo-gym depends on openai<=Y`): the main venv has extra
    packages installed. Recreate it with `uv sync --extra dev` only — see the
    setup note above.
-3. Slow episodes are usually docker pulls (each task has its own image,
+2. Slow episodes are usually docker pulls (each task has its own image,
    fetched on first use) or the in-container SWE-bench evaluation
    (server-side `eval_timeout`, default 1800s). `NEMO_GYM_RUN_TIMEOUT`
    (default 3600s) caps one episode end-to-end on the Miles side.
-4. A failed episode surfaces as `sample.metadata["eval_report"]["error"]` with
+3. A failed episode surfaces as `sample.metadata["eval_report"]["error"]` with
    a traceback from the NeMo Gym server — check there before digging into
    server logs.
